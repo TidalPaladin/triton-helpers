@@ -28,3 +28,13 @@ def diag(t: tl.tensor, SIZE: tl.constexpr) -> tl.tensor:
     output = tl.zeros((SIZE, SIZE), dtype=t.dtype)
     output = tl.where(block_idx[:, None] == block_idx, t, output)
     return tl.sum(output, 1)
+
+
+@triton.jit
+def relu(x: tl.tensor) -> tl.tensor:
+    return tl.where(x < 0, to_tensor(0, x.dtype), x)
+
+
+@triton.jit
+def silu(x: tl.tensor) -> tl.tensor:
+    return x * tl.sigmoid(x.to(tl.float32)).to(x.dtype)

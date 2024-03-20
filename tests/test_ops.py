@@ -1,10 +1,11 @@
 import pytest
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch.testing import assert_close
 
-from triton_helpers.ops import diag, norm_coeff, offset_grid, to_tensor
+from triton_helpers.ops import diag, norm_coeff, offset_grid, relu, silu, to_tensor
 
 
 @pytest.mark.cuda
@@ -66,3 +67,49 @@ def test_diag():
     o = i.new_empty(M)
     kernel[(1,)](i, o, M)  # type: ignore
     assert_close(o, i.diag())
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    "dtype, tol",
+    [
+        (torch.float32, 1e-4),
+        (torch.float16, 1e-2),
+        (torch.bfloat16, 1e-2),
+    ],
+)
+def test_relu(dtype, tol):
+    @triton.jit
+    def kernel(i_p, o_p, BLOCK: tl.constexpr):
+        x = tl.load(i_p + tl.arange(0, BLOCK))
+        x = relu(x)
+        tl.store(o_p + tl.arange(0, BLOCK), x)
+
+    M = 64
+    i = torch.randn(M, device="cuda", dtype=dtype)
+    o = i.new_empty(M)
+    kernel[(1,)](i, o, M)  # type: ignore
+    assert_close(o, F.relu(i), atol=tol, rtol=0)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    "dtype, tol",
+    [
+        (torch.float32, 1e-4),
+        (torch.float16, 1e-2),
+        (torch.bfloat16, 1e-2),
+    ],
+)
+def test_silu(dtype, tol):
+    @triton.jit
+    def kernel(i_p, o_p, BLOCK: tl.constexpr):
+        x = tl.load(i_p + tl.arange(0, BLOCK))
+        x = silu(x)
+        tl.store(o_p + tl.arange(0, BLOCK), x)
+
+    M = 64
+    i = torch.randn(M, device="cuda", dtype=dtype)
+    o = i.new_empty(M)
+    kernel[(1,)](i, o, M)  # type: ignore
+    assert_close(o, F.silu(i), atol=tol, rtol=0)
