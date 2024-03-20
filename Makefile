@@ -73,10 +73,12 @@ test-pdb-%: ## run unit tests matching a pattern with PDB fallback
 	$(PYTHON) -m pytest -rs --pdb -k $* -v ./tests/ 
 
 test-ci: ## runs CI-only tests
+	export "CUDA_VISIBLE_DEVICES=''" && \
 	$(PYTHON) -m pytest \
 		--cov=./$(PROJECT) \
 		--cov-report=xml \
-		-s -v \
+		--cov-report=term \
+		-rs \
 		-m "not ci_skip" \
 		-m "not cuda" \
 		./tests/

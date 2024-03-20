@@ -50,7 +50,7 @@ def entrypoint():
 def test_benchmark(mocker, entrypoint, tmp_path, device, mode, line_arg):
     spy = mocker.spy(Baseline, "forward")
     if not torch.cuda.is_available():
-        mocker.patch("torch.cuda.synchronize")
+        mocker.patch("triton.testing.do_bench", return_value=(2, 1, 3))
     argv = [
         "benchmark",
         "-o",
@@ -69,7 +69,8 @@ def test_benchmark(mocker, entrypoint, tmp_path, device, mode, line_arg):
         line_arg,
     ]
     entrypoint(argv)
-    spy.assert_called()
+    if torch.cuda.is_available():
+        spy.assert_called()
     files = list(tmp_path.glob("*"))
     assert len(files)
 
@@ -85,6 +86,10 @@ def test_profile(mocker, entrypoint, device):
     if torch.cuda.is_available():
         start = mocker.spy(torch.cuda.cudart(), "cudaProfilerStart")
         stop = mocker.spy(torch.cuda.cudart(), "cudaProfilerStop")
+    else:
+        mocker.patch("torch.cuda.cudart")
+        mocker.patch("torch.cuda.synchronize")
+
     argv = [
         "profile",
         "--device",

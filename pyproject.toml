@@ -65,6 +65,7 @@ test = [
   "pytest",
   "pytest-mock",
   "pytest-cov",
+  "pytest-env",
   "coverage",
   "pdbpp",
 ]
