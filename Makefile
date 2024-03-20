@@ -78,6 +78,7 @@ test-ci: ## runs CI-only tests
 		--cov-report=xml \
 		-s -v \
 		-m "not ci_skip" \
+		-m "not cuda" \
 		./tests/
 
 types: node_modules
