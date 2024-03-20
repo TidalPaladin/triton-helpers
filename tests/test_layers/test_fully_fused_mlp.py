@@ -24,6 +24,7 @@ class MLP(nn.Module):
         return x
 
 
+@pytest.mark.cuda
 @pytest.mark.parametrize(
     "dtype,fp16_acc,tol",
     [
@@ -55,6 +56,7 @@ def test_forward_shallow(dtype, tol, fp16_acc):
     assert_close(baseline, actual, rtol=tol, atol=tol, check_dtype=False)
 
 
+@pytest.mark.cuda
 @pytest.mark.parametrize(
     "dtype,fp16_acc,tol",
     [
