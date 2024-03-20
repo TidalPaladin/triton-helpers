@@ -1,6 +1,6 @@
 .PHONY: clean clean-env check quality style tag-version test env upload upload-test
 
-PROJECT=project
+PROJECT=triton_helpers
 QUALITY_DIRS=$(PROJECT) tests
 CLEAN_DIRS=$(PROJECT) tests
 PYTHON=pdm run python

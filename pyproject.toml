@@ -3,18 +3,25 @@ requires = ["pdm-pep517>=1.0"]
 build-backend = "pdm.pep517.api"
 
 [project]
-name = "python-template"
+name = "triton-helpers"
 description = ""
 requires-python = ">=3.11"
 authors = [
     {name = "Scott Chase Waggener", email = "tidalpaladin@protonmail.com"},
 ]
-dependencies = []
+dependencies = [
+    "torch>=2.2.1",
+    "triton>=2.2.0",
+    "pandas>=2.2.1",
+    "pyarrow>=15.0.2",
+    "tqdm>=4.66.2",
+    "jsonargparse[signatures]>=4.27.6",
+    "setuptools>=69.2.0",
+    "matplotlib>=3.8.3",
+]
 readme = "README.md"
 license = {text = "Apache"}
 dynamic = ["version"]
-
-[project.optional-dependencies]
 
 [tool.autoflake]
 remove-all-unused-imports = true
@@ -72,6 +79,7 @@ quality = [
 [tool.pytest.ini_options]
 markers = [
   "ci_skip",
+  "cuda",
 ]
 filterwarnings = []
 
