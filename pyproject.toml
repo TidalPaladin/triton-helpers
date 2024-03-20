@@ -57,6 +57,11 @@ ignore = ["src/oldstuff"]
 pythonVersion = "3.11"
 pythonPlatform = "Linux"
 
+[tool.coverage.report]
+omit = [
+  "triton_helpers/layers/**/__main__.py"
+]
+
 [tool.pdm]
 version = { source = "scm" }
 

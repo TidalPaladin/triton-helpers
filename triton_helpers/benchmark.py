@@ -311,7 +311,8 @@ class CLI:
                 raise ValueError(f"Unsupported line arg {self.line_arg}")  # pragma: no cover
 
         # Prepare the progress bar
-        total_tests = len(x_dim) * len(line_vals) * prod(len(d) for d in charts.values())
+        total_dims = prod(len(d) for d in charts.get("dim", []))
+        total_tests = len(x_dim) * len(line_vals) * prod(len(d) for k, d in charts.items() if k != "dim") * total_dims
         bar = tqdm(total=total_tests, desc="Working")
         for kernel in self.kernels:
             kernel.callback = lambda: bar.update(1)
@@ -338,6 +339,7 @@ class CLI:
                 line_vals,
                 line_names,
                 charts,
+                self.x_label,
             ):
                 wrapped = triton.testing.perf_report(config)(func)
                 df = cast(
@@ -364,11 +366,12 @@ class CLI:
         line_vals: Sequence[Any],
         line_names: Sequence[str],
         charts: Dict[str, Sequence[Any]],
+        x_label: str = "Input size",
     ) -> Iterator[triton.testing.Benchmark]:
         # Bind static args
         Benchmark = partial(
             triton.testing.Benchmark,
-            xlabel="Input Size",
+            xlabel=x_label,
             line_arg=line_arg,
             line_vals=list(line_vals),
             line_names=list(line_names),
