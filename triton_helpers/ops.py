@@ -77,7 +77,7 @@ def import_path(path: str | tl.constexpr) -> Any:
         >>> FN: tl.constexpr = tl.constexpr(import_path("triton_helpers.ops.relu"))
     """
     if isinstance(path, tl.constexpr):
-        path = path.value # type: ignore
+        path = path.value  # type: ignore
     assert isinstance(path, str)
     func_name = path.split(".")[-1]
     module_name = ".".join(path.split(".")[:-1])
