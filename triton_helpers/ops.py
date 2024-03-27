@@ -1,3 +1,6 @@
+from importlib import import_module
+from typing import Any, Iterable
+
 import triton
 import triton.language as tl
 
@@ -38,3 +41,44 @@ def relu(x: tl.tensor) -> tl.tensor:
 @triton.jit
 def silu(x: tl.tensor) -> tl.tensor:
     return x * tl.sigmoid(x.to(tl.float32)).to(x.dtype)
+
+
+def ensure_str(fn: str | triton.JITFunction, choices: Iterable[str] | None = None) -> str:
+    r"""Ensure a function is a string, optionally checking it against a set of choices.
+
+    Args:
+        fn: Function to check. Can be a string or JIT function. If a JIT function, its module and name will be used.
+        choices: Optional set of choices to check against.
+
+    Returns:
+        Function as a string.
+    """
+    if isinstance(fn, str):
+        if (choices is not None) and fn not in (choices := set(choices)):
+            raise ValueError(f"Function {fn} not in {choices}")
+        return fn
+    else:
+        fn = f"{fn.__module__}.{fn.__name__}"
+    return fn
+
+
+def import_path(path: str | tl.constexpr) -> Any:
+    r"""Import a function from a module given its path.
+
+    This will generally be used to parameterize a function within a kernel, e.g. for a custom activation function.
+
+    Args:
+        path: The path to the function to import.
+
+    Returns:
+        Imported function.
+
+    Example:
+        >>> FN: tl.constexpr = tl.constexpr(import_path("triton_helpers.ops.relu"))
+    """
+    if isinstance(path, tl.constexpr):
+        path = path.value  # type: ignore
+    assert isinstance(path, str)
+    func_name = path.split(".")[-1]
+    module_name = ".".join(path.split(".")[:-1])
+    return getattr(import_module(module_name), func_name)
