@@ -6,7 +6,7 @@ from torch import Tensor
 from torch.autograd import Function
 
 from ...heuristics import PowerOfTwoHeuristic
-from ...ops import relu, silu
+from ...ops import ensure_str, import_path, relu, silu
 
 
 # Above this size we can't keep weights in SRAM
@@ -37,7 +37,8 @@ def feedforward(
     elif ACTIVATION == "none":
         pass
     else:
-        tl.static_assert(False, "Unknown activation")
+        FN: tl.constexpr = tl.constexpr(import_path(ACTIVATION))
+        x = FN(x)
 
     return x
 
@@ -167,7 +168,7 @@ class _mlp_forward(Function):
         w_in: Tensor, b_in: Tensor, 
         w_out: Tensor, b_out: Tensor, 
         w_hid: Tensor | None, b_hid: Tensor | None,
-        activation: str = "relu",  
+        activation: str | triton.JITFunction = "relu",  
         fp16_acc: bool = False,
     ) -> Tensor:
         B, L, D = x.shape
@@ -185,6 +186,7 @@ class _mlp_forward(Function):
         assert D_hidden & (D_hidden - 1) == 0, "Hidden dimension must be a power of 2"
         assert D_hidden >= 16, "Hidden dimension must be at least 16"
 
+        # Init hidden layer weights
         if w_hid is not None and b_hid is not None:
             depth = w_hid.shape[0] // D_hidden
             assert w_hid.shape == (depth * D_hidden, D_hidden), "Hidden weight shape mismatch"
@@ -192,13 +194,13 @@ class _mlp_forward(Function):
             depth += 1
         else:
             depth = 1
-            w_hid = x.new_empty(
-                0,
-            )
-            b_hid = x.new_empty(
-                0,
-            )
+            w_hid = x.new_empty(0)
+            b_hid = x.new_empty(0)
 
+        # Handle non-str activation
+        activation = ensure_str(activation, choices=["relu", "silu", "none"])
+
+        # Init output
         o = x.new_empty((B, L, D_out))
 
         def grid(META):
@@ -237,7 +239,7 @@ def fully_fused_mlp(
     w_in: Tensor, b_in: Tensor, 
     w_out: Tensor, b_out: Tensor, 
     w_hid: Tensor | None = None, b_hid: Tensor | None = None, 
-    activation: str = "relu", 
+    activation: str | triton.JITFunction = "relu", 
     fp16_acc: bool = False,
     # fmt: on
 ) -> Tensor:
@@ -259,7 +261,7 @@ def fully_fused_mlp(
         w_out: Weight tensor for the output layer
         b_out: Bias tensor for the output layer, or None if there are no additional layers
         w_hid: Weight tensor for the hidden layers, or None if there are no additional layers
-        activation: Activation function to use. Can be "relu" or "silu".
+        activation: Activation function to use. Can be "relu", "silu", "none", or a custom Triton function.
         fp16_acc: Use FP16 for accumulation. This will reduce precision and may lead to numerical instability, but
             is faster.
 
