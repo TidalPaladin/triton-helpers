@@ -17,6 +17,11 @@ class MLP(nn.Module):
         self.layer_out = nn.Linear(D_hidden, D_out)
         self.activation = activation
 
+        for layer in self.modules():
+            if isinstance(layer, nn.Linear):
+                nn.init.xavier_normal_(layer.weight)
+                nn.init.uniform_(layer.bias, -0.1, 0.1)
+
     def forward(self, x: Tensor) -> Tensor:
         x = self.activation(self.layer_in(x))
         for layer in self.layer_hidden:
