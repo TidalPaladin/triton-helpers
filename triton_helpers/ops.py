@@ -39,8 +39,20 @@ def relu(x: tl.tensor) -> tl.tensor:
 
 
 @triton.jit
+def relu_bwd(x: tl.tensor, grad: tl.tensor) -> tl.tensor:
+    return tl.where(x > 0, grad, to_tensor(0, grad.dtype))
+
+
+@triton.jit
 def silu(x: tl.tensor) -> tl.tensor:
     return x * tl.sigmoid(x.to(tl.float32)).to(x.dtype)
+
+
+@triton.jit
+def silu_bwd(x: tl.tensor, grad: tl.tensor) -> tl.tensor:
+    s = tl.sigmoid(x.to(tl.float32)).to(x.dtype)
+    # Try to set up a FMA
+    return grad * s * (x * (1 - s) + 1)
 
 
 def ensure_str(fn: str | triton.JITFunction, choices: Iterable[str] | None = None) -> str:
