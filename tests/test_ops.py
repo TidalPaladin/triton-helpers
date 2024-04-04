@@ -115,11 +115,10 @@ def test_relu_bwd(dtype, tol):
     i = torch.randn(M, device="cuda", dtype=dtype, requires_grad=True)
     o = i.new_empty(M)
     y = F.relu(i)
-    y.retain_grad()
-    y.sin().sum().backward()
-
+    do = torch.randn_like(y)
+    y.backward(do)
     baseline = i.grad
-    kernel[(1,)](i, y.grad, o, M)  # type: ignore
+    kernel[(1,)](i, do, o, M)  # type: ignore
     assert_close(o, baseline, atol=tol, rtol=0)
 
 
@@ -169,8 +168,8 @@ def test_silu_bwd(dtype, tol):
     i = torch.randn(M, device="cuda", dtype=dtype, requires_grad=True)
     o = i.new_empty(M)
     y = F.silu(i)
-    y.retain_grad()
-    y.sin().sum().backward()
+    do = torch.randn_like(y)
+    y.backward(do)
     baseline = i.grad
-    kernel[(1,)](i, y.grad, o, M)  # type: ignore
+    kernel[(1,)](i, do, o, M)  # type: ignore
     assert_close(o, baseline, atol=tol, rtol=0)
