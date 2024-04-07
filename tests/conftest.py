@@ -1,3 +1,6 @@
+import os
+
+import pytest
 import torch
 
 
@@ -27,3 +30,11 @@ def handle_cuda_mark(item):  # pragma: no cover
 
 def pytest_runtest_setup(item):
     handle_cuda_mark(item)
+
+
+@pytest.fixture(autouse=True)
+def triton_cache(tmp_path):
+    # Uses a fresh temporary cache directory for each test
+    path = tmp_path / ".triton"
+    os.environ["TRITON_CACHE_DIR"] = str(path)
+    return path

@@ -58,7 +58,7 @@ class Baseline(KernelExecutor):
             x = F.linear(x, w, b)
             x = F.relu(x)
 
-        x = F.linear(w_out, b_out)
+        x = F.linear(x, w_out, b_out)
         return x
 
 
@@ -85,7 +85,7 @@ if __name__ == "__main__":
         "MLP",
         [Baseline("baseline"), Triton("fully-fused"), Triton("fully-fused-acc16", fp16_acc=True)],
         dims={
-            "H": ((1, 8, 1), "linspace"),
+            "H": ((1, 10, 1), "linspace"),
             "D": (64, "values"),
             "L": (1024, "values"),
         },
