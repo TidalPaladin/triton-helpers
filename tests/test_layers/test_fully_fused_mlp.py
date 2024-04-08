@@ -365,7 +365,7 @@ def test_backward_deep(dtype, tol, fp16_acc, depth):
 
 
 @pytest.mark.cuda
-@pytest.mark.parametrize("depth", [1, 4])
+@pytest.mark.parametrize("depth", [1, 4, 8])
 def test_module(depth):
     torch.random.manual_seed(0)
     D_in = 8
@@ -383,9 +383,11 @@ def test_module(depth):
     # Baseline output
     with torch.autocast(device_type="cuda", dtype=torch.float16):
         baseline_y = layer(x)
+    baseline_y.sum().backward()
 
     # Triton output
     with torch.autocast(device_type="cuda", dtype=torch.float16):
         y = layer2(x)
+    y.sum().backward()
 
     assert_close(baseline_y, y, rtol=tol, atol=tol, check_dtype=False)
