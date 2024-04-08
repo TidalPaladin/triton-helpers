@@ -173,6 +173,24 @@ def _fwd_inner(
     return x
 
 
+@triton.jit(noinline=True)
+def _fwd_inner_to_depth(
+    # fmt: off
+    # Inputs
+    x, w_in_p, b_in_p, w_hid_p, b_hid_p,
+    # Sizes
+    D_in: int, D_hidden: int,
+    # Params
+    stop_depth: int,
+    ACTIVATION: tl.constexpr, DTYPE: tl.constexpr, DEPTH: tl.constexpr,
+    # Blocks
+    BLOCK_D_IN: tl.constexpr, BLOCK_D_HIDDEN: tl.constexpr,
+    # fmt: on
+) -> tl.tensor:
+
+    return x
+
+
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_L": 16}),
@@ -188,7 +206,6 @@ def _fwd_inner(
         BLOCK_D_HIDDEN=PowerOfTwoHeuristic("D_hidden", 16),
         BLOCK_D_OUT=PowerOfTwoHeuristic("D_out", 16),
         BLOCK_L=PowerOfTwoHeuristic("L", min_val=16, max_val=128),
-        num_warps=lambda _: 4,
     )
 )
 @triton.jit
@@ -229,7 +246,7 @@ def _fwd_kernel(
         # fmt: off
         x, w_in_p, b_in_p, w_hid_p, b_hid_p, 
         D_in, D_hidden,
-        ACTIVATION, DTYPE, DEPTH, 
+        ACTIVATION, DTYPE, DEPTH,
         BLOCK_D_IN, BLOCK_D_HIDDEN,
         # fmt: on
     )
@@ -300,15 +317,15 @@ def _bwd_inner(
     return dx
 
 
-# @triton.autotune(
-#    configs=[
-#        triton.Config({"BLOCK_L": 16}),
-#        triton.Config({"BLOCK_L": 32}),
-#        triton.Config({"BLOCK_L": 64}),
-#    ],
-#    key=["L", "D_in", "D_hidden", "D_out", "DEPTH"],
-#    reset_to_zero=["dw_in_p", "db_in_p", "dw_hid_p", "db_hid_p", "dw_out_p", "db_out_p"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_L": 16}),
+        triton.Config({"BLOCK_L": 32}),
+        triton.Config({"BLOCK_L": 64}),
+    ],
+    key=["L", "D_in", "D_hidden", "D_out", "DEPTH"],
+    reset_to_zero=["dw_in_p", "db_in_p", "dw_hid_p", "db_hid_p", "dw_out_p", "db_out_p"],
+)
 @triton.heuristics(
     dict(
         BLOCK_D_IN=PowerOfTwoHeuristic("D_in", 16),
@@ -338,6 +355,8 @@ def _bwd_kernel_rfs(
     BLOCK_L: tl.constexpr, BLOCK_D_IN: tl.constexpr, BLOCK_D_HIDDEN: tl.constexpr, BLOCK_D_OUT: tl.constexpr,
     # fmt: on
 ):
+    # This kernel implements the backward pass by recomputing the forward pass in reverse DEPTH-1 times.
+
     # Select offsets for this block
     start = tl.program_id(0) * BLOCK_L
 
@@ -381,7 +400,7 @@ def _bwd_kernel_rfs(
         # fmt: off
         x, w_in_p, b_in_p, w_hid_p, b_hid_p, 
         D_in, D_hidden,
-        ACTIVATION, DTYPE, DEPTH, 
+        ACTIVATION, DTYPE, DEPTH,
         BLOCK_D_IN, BLOCK_D_HIDDEN,
         # fmt: on
     )
@@ -403,25 +422,41 @@ def _bwd_kernel_rfs(
         "none", DTYPE, USE_LOCK,
         # fmt: on
     )
-    LOCK_STRIDE: tl.constexpr = 2
-    lock_p += LOCK_STRIDE
+    lock_p += 1
 
     # Init hidden dw / db block pointers at the end of the block.
     # We will work backwards through the hidden layers.
+    #
+    # NOTE: The inner loop duplicates parts of _fwd_inner. Calling the function would be cleaner,
+    # but results in `DEPTH-1` recompilations of _fwd_inner, which is very slow.
+    # It's not clear why - efforts to avoid DEPTH being a tl.constexpr in _fwd_inner did not help.
     H: tl.constexpr = DEPTH - 1
     DW_block_ptr = _make_w_block_ptr(dw_hid_p, D_hidden, D_hidden, BLOCK_D_HIDDEN, BLOCK_D_HIDDEN, H, True)
-    DB_block_ptr = (_make_b_block_ptr(db_hid_p, D_hidden, BLOCK_D_HIDDEN, H, True),)
-    W_block_ptr = _make_w_block_ptr(w_hid_p, D_hidden, D_hidden, BLOCK_D_HIDDEN, BLOCK_D_HIDDEN, H, True)
-    B_block_ptr = _make_b_block_ptr(b_hid_p, D_hidden, BLOCK_D_HIDDEN, H, True)
+    DB_block_ptr = _make_b_block_ptr(db_hid_p, D_hidden, BLOCK_D_HIDDEN, H, True)
     for i in tl.static_range(H):
-        x_prev = _fwd_inner(
-            # fmt: off
-            x, w_in_p, b_in_p, w_hid_p, b_hid_p, 
-            D_in, D_hidden,
-            ACTIVATION, DTYPE, DEPTH - (i + 1), 
-            BLOCK_D_IN, BLOCK_D_HIDDEN,
-            # fmt: on
+        # Input layer
+        w_in = tl.load(
+            _make_w_block_ptr(w_in_p, D_in, D_hidden, BLOCK_D_IN, BLOCK_D_HIDDEN),
+            boundary_check=(0, 1),
         )
+        b_in = tl.load(
+            _make_b_block_ptr(b_in_p, D_hidden, BLOCK_D_HIDDEN),
+            boundary_check=(1,),
+        )
+        x_prev = feedforward(x, w_in, b_in, ACTIVATION=ACTIVATION, DTYPE=DTYPE)
+
+        # Possible hidden layers
+        W_block_ptr = _make_w_block_ptr(w_hid_p, D_hidden, D_hidden, BLOCK_D_HIDDEN, BLOCK_D_HIDDEN, H)
+        B_block_ptr = _make_b_block_ptr(b_hid_p, D_hidden, BLOCK_D_HIDDEN, H)
+        for _ in range(H - (i + 1)):
+            # Hidden forward
+            w_hid = tl.load(W_block_ptr, boundary_check=(0, 1))
+            b_hid = tl.load(B_block_ptr, boundary_check=(1,))
+            x_prev = feedforward(x_prev, w_hid, b_hid, ACTIVATION=ACTIVATION, DTYPE=DTYPE)
+
+            # Advance pointers
+            W_block_ptr = tl.advance(W_block_ptr, (BLOCK_D_HIDDEN, 0))
+            B_block_ptr = tl.advance(B_block_ptr, (1, 0))
 
         w_h = tl.load(W_block_ptr, boundary_check=(0, 1), eviction_policy="evict_first")
         b_h = tl.load(B_block_ptr, boundary_check=(1,), eviction_policy="evict_first")
@@ -435,12 +470,11 @@ def _bwd_kernel_rfs(
         )
 
         # Update pointers
+        # NOTE: Conditional is needed to silence warnings about tl.advance
         if i < H - 1:
-            W_block_ptr = tl.advance(W_block_ptr, (-BLOCK_D_HIDDEN, 0))
-            B_block_ptr = tl.advance(B_block_ptr, (-1, 0))
             DW_block_ptr = tl.advance(DW_block_ptr, (-BLOCK_D_HIDDEN, 0))
             DB_block_ptr = tl.advance(DB_block_ptr, (-1, 0))
-        lock_p += LOCK_STRIDE
+        lock_p += 1
 
     # Backward through input layer
     w = tl.load(
@@ -479,7 +513,7 @@ def _bwd_kernel_rfs(
     )
 
 
-class _mlp_forward(Function):
+class _fully_fused_mlp(Function):
 
     @torch.no_grad()
     @staticmethod
@@ -550,6 +584,8 @@ class _mlp_forward(Function):
     @staticmethod
     def backward(ctx, do: Tensor):
         x, w_in, b_in, w_out, b_out, w_hid, b_hid = cast(Sequence[Tensor], ctx.saved_tensors)
+        # TODO: Can this be fixed? Fails with python abort, no error message.
+        assert x.dtype != torch.float32 or ctx.depth < 4, "FP32 backward not supported for depth >= 4"
 
         B, L, D_in = x.shape
         D_hidden, _ = w_in.shape
@@ -557,7 +593,8 @@ class _mlp_forward(Function):
 
         dx = x.new_empty(x.shape)
 
-        # Init of these tensors depends on depth
+        # Init of these tensors depends on choice of locking, which depends on depth
+        # Deadlocks seem to become an issue at small depths, so we only use locking for depth > 5.
         if USE_LOCK := ctx.depth > 5:
             dw_in = torch.zeros_like(w_in)
             db_in = torch.zeros_like(b_in)
@@ -565,9 +602,9 @@ class _mlp_forward(Function):
             db_hid = torch.zeros_like(b_hid)
             dw_out = torch.zeros_like(w_out)
             db_out = torch.zeros_like(b_out)
-            locks = torch.empty(2 * (ctx.depth + 1), dtype=torch.int32, device=x.device)
-            # For some reason FP16 acc is much slower when locking is used
-            fp16_acc = False
+            locks = torch.empty(ctx.depth + 1, dtype=torch.int32, device=x.device)
+            # For some reason FP16 acc is much slower when locking is used at small L
+            fp16_acc = True
         else:
             G_max = triton.cdiv(B * L, 16)
             dw_in = w_in.new_empty(G_max, *w_in.shape)
@@ -625,7 +662,11 @@ def fully_fused_mlp(
     This implementation of a fully fused MLP is inspired by the approach described in [1]. Scaling is particularly
     effective with multiple layers.
 
-    .. [1] Müller, T., Evans, B., Schied, C., & Keller, A. (2021). Real-time Neural Radiance Caching for Path Tracing. arXiv preprint arXiv:2106.12372.
+    .. note::
+        The forward-backward latency of this kernel is only significantly superior to the non-fused version for small inputs
+        or for large depth. Forward latency of htis kernel is superior for all inputs.
+
+    .. [1] Mller, T., Evans, B., Schied, C., & Keller, A. (2021). Real-time Neural Radiance Caching for Path Tracing. arXiv preprint arXiv:2106.12372.
         Available at https://arxiv.org/abs/2106.12372
 
     Args:
@@ -652,4 +693,4 @@ def fully_fused_mlp(
     Returns:
         Output of MLP forward pass.
     """
-    return _mlp_forward.apply(x, w_in, b_in, w_out, b_out, w_hid, b_hid, activation, fp16_acc)  # type: ignore
+    return _fully_fused_mlp.apply(x, w_in, b_in, w_out, b_out, w_hid, b_hid, activation, fp16_acc)  # type: ignore

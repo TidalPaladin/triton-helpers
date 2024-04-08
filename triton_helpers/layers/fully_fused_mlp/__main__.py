@@ -85,8 +85,8 @@ if __name__ == "__main__":
         "MLP",
         [Baseline("baseline"), Triton("fully-fused"), Triton("fully-fused-acc16", fp16_acc=True)],
         dims={
-            "H": ((1, 10, 1), "linspace"),
+            "L": ((512, 2048, 8192, 16384, 32768, 65536), "values"),
             "D": (64, "values"),
-            "L": (1024, "values"),
+            "H": (8, "values"),
         },
     )

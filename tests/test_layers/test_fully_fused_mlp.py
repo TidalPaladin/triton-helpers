@@ -9,6 +9,7 @@ from torch import Tensor
 from torch.testing import assert_close
 
 from triton_helpers.layers.fully_fused_mlp import (
+    FullyFusedMLP,
     feedforward_bwd_dw,
     feedforward_bwd_dx,
     feedforward_bwd_dz,
@@ -38,6 +39,7 @@ class MLP(nn.Module):
 @pytest.mark.parametrize(
     "dtype,fp16_acc,tol",
     [
+        (torch.float32, False, 1e-3),
         (torch.float16, False, 1e-2),
         (torch.bfloat16, False, 1e-2),
         (torch.float16, True, 1e-2),
@@ -67,16 +69,18 @@ def test_forward_shallow(dtype, tol, fp16_acc):
 
 
 @pytest.mark.cuda
+@pytest.mark.parametrize("depth", [8, 32])
 @pytest.mark.parametrize(
     "dtype,fp16_acc,tol",
     [
+        (torch.float32, False, 1e-3),
         (torch.float16, False, 1e-2),
         (torch.bfloat16, False, 1e-2),
         (torch.float16, True, 1e-2),
         (torch.bfloat16, True, 1e-2),
     ],
 )
-def test_forward_deep(dtype, tol, fp16_acc):
+def test_forward_deep(dtype, tol, fp16_acc, depth):
     torch.random.manual_seed(0)
     D_in = 1
     D_hidden = 32
@@ -84,7 +88,7 @@ def test_forward_deep(dtype, tol, fp16_acc):
     B, L = 3, 40
 
     x = torch.randn((B, L, D_in), device="cuda")
-    layer = MLP(D_in, D_hidden, D_out, depth=3).to("cuda")
+    layer = MLP(D_in, D_hidden, D_out, depth=depth).to("cuda")
 
     w_hid = torch.cat([l.weight for l in layer.layer_hidden], dim=0)
     b_hid = torch.cat([l.bias.view(1, -1) for l in layer.layer_hidden], dim=0)
@@ -227,6 +231,7 @@ def test_backward_dx(dtype, tol):
 @pytest.mark.parametrize(
     "dtype,fp16_acc,tol",
     [
+        (torch.float32, False, 1e-2),
         (torch.float16, False, 1e-2),
         (torch.bfloat16, False, 1e-2),
         (torch.float16, True, 1e-2),
@@ -284,7 +289,7 @@ def test_backward_shallow(dtype, tol, fp16_acc):
 
 
 @pytest.mark.cuda
-@pytest.mark.parametrize("depth", [3, 10])
+@pytest.mark.parametrize("depth", [3, 8, 16, 32])
 @pytest.mark.parametrize(
     "dtype,fp16_acc,tol",
     [
@@ -357,3 +362,30 @@ def test_backward_deep(dtype, tol, fp16_acc, depth):
     assert_close(baseline_dw_in, dw_in, rtol=tol, atol=tol, check_dtype=False)
 
     assert_close(baseline_dx, dx, rtol=tol, atol=tol, check_dtype=False)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("depth", [1, 4])
+def test_module(depth):
+    torch.random.manual_seed(0)
+    D_in = 8
+    D_hidden = 16
+    D_out = 4
+    B, L = 2, 2
+
+    tol = 1e-2
+    x = torch.randn((B, L, D_in), device="cuda", requires_grad=True)
+    torch.random.manual_seed(0)
+    layer = MLP(D_in, D_hidden, D_out, depth=depth).to("cuda")
+    torch.random.manual_seed(0)
+    layer2 = FullyFusedMLP(D_in, D_hidden, D_out, depth=depth).to("cuda")
+
+    # Baseline output
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        baseline_y = layer(x)
+
+    # Triton output
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        y = layer2(x)
+
+    assert_close(baseline_y, y, rtol=tol, atol=tol, check_dtype=False)
