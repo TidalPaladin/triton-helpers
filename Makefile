@@ -10,6 +10,11 @@ ifneq ($(wildcard $(CONFIG_FILE)),)
 include $(CONFIG_FILE)
 endif
 
+benchmark-fused-mlp:
+	pdm run python -m triton_helpers.layers.fully_fused_mlp benchmark \
+	-o triton_helpers/layers/fully_fused_mlp/benchmarks/ --x-label "MLP Depth" \
+	-m fwd fwd-bwd -p baseline fully-fused fully-fused-acc16 -H 1 4 8 16 -d fp16 bf16
+
 check: ## run quality checks and unit tests
 	$(MAKE) style
 	$(MAKE) quality

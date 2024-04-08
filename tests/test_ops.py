@@ -86,6 +86,7 @@ def test_relu(dtype, tol):
         tl.store(o_p + tl.arange(0, BLOCK), x)
 
     M = 64
+    torch.random.manual_seed(0)
     i = torch.randn(M, device="cuda", dtype=dtype)
     o = i.new_empty(M)
     kernel[(1,)](i, o, M)  # type: ignore
@@ -110,11 +111,14 @@ def test_relu_bwd(dtype, tol):
         tl.store(o_p + tl.arange(0, BLOCK), dx)
 
     M = 64
+    torch.random.manual_seed(0)
     i = torch.randn(M, device="cuda", dtype=dtype, requires_grad=True)
     o = i.new_empty(M)
-    F.relu(i).sum().backward()
+    y = F.relu(i)
+    do = torch.randn_like(y)
+    y.backward(do)
     baseline = i.grad
-    kernel[(1,)](i, torch.ones_like(i), o, M)  # type: ignore
+    kernel[(1,)](i, do, o, M)  # type: ignore
     assert_close(o, baseline, atol=tol, rtol=0)
 
 
@@ -135,6 +139,7 @@ def test_silu(dtype, tol):
         tl.store(o_p + tl.arange(0, BLOCK), x)
 
     M = 64
+    torch.random.manual_seed(0)
     i = torch.randn(M, device="cuda", dtype=dtype)
     o = i.new_empty(M)
     kernel[(1,)](i, o, M)  # type: ignore
@@ -159,9 +164,12 @@ def test_silu_bwd(dtype, tol):
         tl.store(o_p + tl.arange(0, BLOCK), dx)
 
     M = 64
+    torch.random.manual_seed(0)
     i = torch.randn(M, device="cuda", dtype=dtype, requires_grad=True)
     o = i.new_empty(M)
-    F.silu(i).sum().backward()
+    y = F.silu(i)
+    do = torch.randn_like(y)
+    y.backward(do)
     baseline = i.grad
-    kernel[(1,)](i, torch.ones_like(i), o, M)  # type: ignore
+    kernel[(1,)](i, do, o, M)  # type: ignore
     assert_close(o, baseline, atol=tol, rtol=0)
