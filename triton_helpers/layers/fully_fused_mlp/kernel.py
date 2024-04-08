@@ -173,24 +173,6 @@ def _fwd_inner(
     return x
 
 
-@triton.jit(noinline=True)
-def _fwd_inner_to_depth(
-    # fmt: off
-    # Inputs
-    x, w_in_p, b_in_p, w_hid_p, b_hid_p,
-    # Sizes
-    D_in: int, D_hidden: int,
-    # Params
-    stop_depth: int,
-    ACTIVATION: tl.constexpr, DTYPE: tl.constexpr, DEPTH: tl.constexpr,
-    # Blocks
-    BLOCK_D_IN: tl.constexpr, BLOCK_D_HIDDEN: tl.constexpr,
-    # fmt: on
-) -> tl.tensor:
-
-    return x
-
-
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_L": 16}),
@@ -515,6 +497,7 @@ def _bwd_kernel_rfs(
 
 class _fully_fused_mlp(Function):
 
+    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float16)
     @torch.no_grad()
     @staticmethod
     def forward(
@@ -580,11 +563,11 @@ class _fully_fused_mlp(Function):
 
         return o
 
+    @torch.cuda.amp.custom_bwd
     @torch.no_grad()
     @staticmethod
     def backward(ctx, do: Tensor):
         x, w_in, b_in, w_out, b_out, w_hid, b_hid = cast(Sequence[Tensor], ctx.saved_tensors)
-        # TODO: Can this be fixed? Fails with python abort, no error message.
         assert x.dtype != torch.float32 or ctx.depth < 4, "FP32 backward not supported for depth >= 4"
 
         B, L, D_in = x.shape
