@@ -18,6 +18,7 @@ dependencies = [
     "jsonargparse[signatures]>=4.27.6",
     "setuptools>=69.2.0",
     "matplotlib>=3.8.3",
+    "tinycudann @ file:///${PROJECT_ROOT}/../tiny-cuda-nn/bindings/torch",
 ]
 readme = "README.md"
 license = {text = "Apache"}

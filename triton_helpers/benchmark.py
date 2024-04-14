@@ -237,6 +237,12 @@ class KernelExecutor:
         result = torch.randn(*args, **kwargs)
         return result
 
+    def rand(self, *args, **kwargs) -> Tensor:
+        defaults = dict(requires_grad=True)
+        defaults.update(kwargs)
+        result = torch.rand(*args, **kwargs)
+        return result
+
 
 @dataclass
 class CLI:

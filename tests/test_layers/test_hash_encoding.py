@@ -44,6 +44,8 @@ def corner_factory():
     return func
 
 
+
+
 @pytest.mark.cuda
 class TestCreateCornerOffsets:
 
@@ -149,9 +151,13 @@ class TestEmbeddingLookup:
             x_p, pi_p, o_p,
             L: tl.constexpr, D: tl.constexpr,
             T_l: int, N_l: int,
-            BLOCK_D: tl.constexpr, BLOCK_L: tl.constexpr,
+            BLOCK_D: tl.constexpr, BLOCK_L: tl.constexpr, NEEDS_HASH: tl.constexpr,
             # fmt: on
         ):
+            start = tl.program_id(0) * BLOCK_L
+            x_p += start
+            o_p += start
+
             # Load x
             X_ptr = tl.make_block_ptr(x_p, (L, D), (D, 1), (0, 0), (BLOCK_L, BLOCK_D), (1, 0))
             x = tl.load(X_ptr, boundary_check=(0, 1))
@@ -162,7 +168,7 @@ class TestEmbeddingLookup:
             pi = tl.load(pi_p + offset_pi, mask=mask_pi)
 
             # Hash
-            o = embedding_lookup(x, pi, D, T_l, N_l, BLOCK_D)
+            o = embedding_lookup(x, pi, D, T_l, N_l, BLOCK_D, NEEDS_HASH).to(o_p.dtype.element_ty)
 
             # Store
             O_ptr = tl.make_block_ptr(o_p, (L, 2**D), (2**D, 1), (0, 0), (BLOCK_L, 2**BLOCK_D), (1, 0))
@@ -210,7 +216,8 @@ class TestEmbeddingLookup:
         o = torch.zeros(L, 2**D, dtype=torch.int64, device="cuda")
         BLOCK_D = triton.next_power_of_2(D)
         BLOCK_L = triton.next_power_of_2(L)
-        kernel[(1,)](x, pi, o, L, D, T, N_level, BLOCK_D, BLOCK_L)
+        NEEDS_HASH = False
+        kernel[(1,)](x, pi, o, L, D, T, N_level, BLOCK_D, BLOCK_L, NEEDS_HASH)
 
         assert (o == baseline).all()
 
@@ -254,7 +261,8 @@ class TestEmbeddingLookup:
         o = torch.zeros(L, 2**D, dtype=torch.int64, device="cuda")
         BLOCK_D = triton.next_power_of_2(D)
         BLOCK_L = triton.next_power_of_2(L)
-        kernel[(1,)](x, pi, o, L, D, T, N_level, BLOCK_D, BLOCK_L)
+        NEEDS_HASH = True
+        kernel[(1,)](x, pi, o, L, D, T, N_level, BLOCK_D, BLOCK_L, NEEDS_HASH)
 
         assert (o == baseline).all()
 
@@ -287,9 +295,32 @@ class TestEmbeddingLookup:
         o = torch.zeros(L, 2**D, dtype=torch.int64, device="cuda")
         BLOCK_D = triton.next_power_of_2(D)
         BLOCK_L = triton.next_power_of_2(L)
-        kernel[(1,)](x, pi, o, L, D, T, N_level, BLOCK_D, BLOCK_L)
+        NEEDS_HASH = not unique
+        kernel[(1,)](x, pi, o, L, D, T, N_level, BLOCK_D, BLOCK_L, NEEDS_HASH)
 
         assert_close(o, baseline, check_device=False, check_dtype=False)
+
+    @pytest.mark.parametrize("N_level", [16, 32, 512])
+    @pytest.mark.parametrize("unique", [False, True])
+    def test_overflow(self, kernel, N_level, unique):
+        torch.random.manual_seed(0)
+        L, D = 16384, 3
+        T = (N_level + 1) ** D - (2 if not unique else 0)
+
+        # Inputs
+        x = torch.rand(L, D, device="cuda")
+        pi = torch.tensor([PI_1, PI_2, PI_3], device="cuda", dtype=torch.int64)
+
+        # Triton
+        o = torch.zeros(L, 2**D, dtype=torch.int64, device="cuda")
+        BLOCK_D = triton.next_power_of_2(D)
+        BLOCK_L = 64
+        NEEDS_HASH = not unique
+        grid = (triton.cdiv(L, BLOCK_L),)
+        kernel[grid](x, pi, o, L, D, T, N_level, BLOCK_D, BLOCK_L, NEEDS_HASH)
+
+        assert (o < T).all()
+        assert (o >= 0).all()
 
 
 @pytest.mark.cuda
@@ -370,13 +401,14 @@ class TestHashEncoding:
         # Shapes
         B, L, D, F = 16, 40, 3, 2
 
-        layer = HashEncoding(2**8, 4, F, 16, 512).cuda()
+        layer = HashEncoding(2**4, 4, F, 16, 512).cuda()
         x = torch.rand(B, L, D, device="cuda")
 
         with torch.autocast(device_type="cuda", dtype=torch.float16):
             o = layer(x)
         assert isinstance(o, Tensor)
         assert o.dtype == torch.float16
+        assert False
 
     def test_backward_module(self):
         # Shapes
@@ -390,3 +422,17 @@ class TestHashEncoding:
 
         o.sum().backward()
         assert layer.embeddings.grad is not None
+
+    def test_backward_large(self):
+        # Shapes
+        B, L, D, F = 1, 32, 3, 2
+
+        layer = HashEncoding(2**4, 16, F, 16, 512).cuda()
+        x = torch.rand(B, L, D, device="cuda", requires_grad=True)
+
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            o = layer(x)
+
+        o.sum().backward()
+        assert layer.embeddings.grad is not None
+        assert False
