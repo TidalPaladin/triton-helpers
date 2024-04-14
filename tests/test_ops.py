@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 from torch.testing import assert_close
 
-from triton_helpers.ops import diag, norm_coeff, offset_grid, relu, silu, to_tensor
+from triton_helpers.ops import diag, norm_coeff, offset_grid, relu, relu_bwd, silu, silu_bwd, to_tensor
 
 
 @pytest.mark.cuda
@@ -86,10 +86,40 @@ def test_relu(dtype, tol):
         tl.store(o_p + tl.arange(0, BLOCK), x)
 
     M = 64
+    torch.random.manual_seed(0)
     i = torch.randn(M, device="cuda", dtype=dtype)
     o = i.new_empty(M)
     kernel[(1,)](i, o, M)  # type: ignore
     assert_close(o, F.relu(i), atol=tol, rtol=0)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    "dtype, tol",
+    [
+        (torch.float32, 1e-4),
+        (torch.float16, 1e-2),
+        (torch.bfloat16, 1e-2),
+    ],
+)
+def test_relu_bwd(dtype, tol):
+    @triton.jit
+    def kernel(i_p, grad_p, o_p, BLOCK: tl.constexpr):
+        x = tl.load(i_p + tl.arange(0, BLOCK))
+        grad = tl.load(grad_p + tl.arange(0, BLOCK))
+        dx = relu_bwd(x, grad)
+        tl.store(o_p + tl.arange(0, BLOCK), dx)
+
+    M = 64
+    torch.random.manual_seed(0)
+    i = torch.randn(M, device="cuda", dtype=dtype, requires_grad=True)
+    o = i.new_empty(M)
+    y = F.relu(i)
+    do = torch.randn_like(y)
+    y.backward(do)
+    baseline = i.grad
+    kernel[(1,)](i, do, o, M)  # type: ignore
+    assert_close(o, baseline, atol=tol, rtol=0)
 
 
 @pytest.mark.cuda
@@ -109,7 +139,37 @@ def test_silu(dtype, tol):
         tl.store(o_p + tl.arange(0, BLOCK), x)
 
     M = 64
+    torch.random.manual_seed(0)
     i = torch.randn(M, device="cuda", dtype=dtype)
     o = i.new_empty(M)
     kernel[(1,)](i, o, M)  # type: ignore
     assert_close(o, F.silu(i), atol=tol, rtol=0)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    "dtype, tol",
+    [
+        (torch.float32, 1e-4),
+        (torch.float16, 1e-2),
+        (torch.bfloat16, 1e-2),
+    ],
+)
+def test_silu_bwd(dtype, tol):
+    @triton.jit
+    def kernel(i_p, grad_p, o_p, BLOCK: tl.constexpr):
+        x = tl.load(i_p + tl.arange(0, BLOCK))
+        grad = tl.load(grad_p + tl.arange(0, BLOCK))
+        dx = silu_bwd(x, grad)
+        tl.store(o_p + tl.arange(0, BLOCK), dx)
+
+    M = 64
+    torch.random.manual_seed(0)
+    i = torch.randn(M, device="cuda", dtype=dtype, requires_grad=True)
+    o = i.new_empty(M)
+    y = F.silu(i)
+    do = torch.randn_like(y)
+    y.backward(do)
+    baseline = i.grad
+    kernel[(1,)](i, do, o, M)  # type: ignore
+    assert_close(o, baseline, atol=tol, rtol=0)
