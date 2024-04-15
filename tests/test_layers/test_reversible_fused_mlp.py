@@ -60,3 +60,56 @@ def test_forward(dtype, tol, fp16_acc, depth):
         fp16_acc=fp16_acc,
     )
     assert_close(baseline, actual, rtol=tol, atol=tol, check_dtype=False)
+
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("depth", [1, 2, 3])
+@pytest.mark.parametrize(
+    "dtype,fp16_acc,tol",
+    [
+        (torch.float16, False, 1e-2),
+        (torch.bfloat16, False, 2e-2),
+        (torch.float16, True, 1e-2),
+        (torch.bfloat16, True, 2e-2),
+    ],
+)
+def test_backward(dtype, tol, fp16_acc, depth):
+    torch.random.manual_seed(0)
+    D = 32
+    B, L = 1, 32
+
+    x = torch.randn((B, L, D), device="cuda", requires_grad=True)
+    layer = ReversibleMLP(D, depth=depth).to("cuda")
+
+    w = torch.cat([l.weight for l in layer.ff], dim=0)
+    b = torch.cat([l.bias.view(1, -1) for l in layer.ff], dim=0)
+
+    # Baseline
+    o = layer(x)
+    o.sum().backward()
+    baseline_dx = x.grad
+    baseline_dw = torch.cat([l.weight.grad for l in layer.ff], dim=0)
+    baseline_db = torch.cat([l.bias.grad for l in layer.ff], dim=0)
+
+    # Zero grads
+    x.grad = None
+    for l in layer.ff:
+        l.weight.grad = None
+        l.bias.grad = None
+
+    # Actual
+    o = reversible_fused_mlp(
+        x.to(dtype),
+        w.to(dtype),
+        b.to(dtype),
+        fp16_acc=fp16_acc,
+    )
+    o.sum().backward()
+    actual_dx = x.grad
+    actual_dw = torch.cat([l.weight.grad for l in layer.ff], dim=0)
+    actual_db = torch.cat([l.bias.grad for l in layer.ff], dim=0)
+
+    assert_close(baseline_dx, actual_dx, rtol=tol, atol=tol, check_dtype=False)
+    assert_close(baseline_dw, actual_dw, rtol=tol, atol=tol, check_dtype=False)
+    assert_close(baseline_db, actual_db, rtol=tol, atol=tol, check_dtype=False)
