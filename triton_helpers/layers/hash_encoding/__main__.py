@@ -39,22 +39,19 @@ class TinyCudaNN(KernelExecutor):
             "module": module,
         }
 
-    def forward(
-        self,
-        x: Tensor,
-        module: nn.Module,
-    ) -> Tensor:
+    def forward(self, x: Tensor, module: nn.Module) -> Tensor:
         return module(x.view(-1, x.size(-1)))
-
 
 
 @dataclass
 class Triton(KernelExecutor):
 
+    @torch.no_grad()
     def prepare_inputs(self, L: int, D: int, F: int, T: int, N: int, X: int, Y: int, **kwargs) -> Dict[str, Tensor | None]:
         x = self.rand((32, L, D), **kwargs)
         layer = HashEncoding(T, N, F, X, Y).to(x.device)
         dtype = kwargs.get("dtype", torch.float32)
+        assert layer.pi is not None
         return {
             "x": x,
             "e": layer.embeddings.to(dtype),

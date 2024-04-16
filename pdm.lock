@@ -5,7 +5,7 @@
 groups = ["default", "quality", "test"]
 strategy = ["cross_platform"]
 lock_version = "4.4.1"
-content_hash = "sha256:6f07846efb1434d6cc93894c582a5465870e09790285c4a9f1a76b4ed83e4d87"
+content_hash = "sha256:facc4fddc3f5c702e775004e950f536a8ec349f55d927c5d94cb584e3d706e31"
 
 [[package]]
 name = "autoflake"
@@ -1020,6 +1020,12 @@ files = [
     {file = "sympy-1.12-py3-none-any.whl", hash = "sha256:c3588cd4295d0c0f603d0f2ae780587e64e2efeedb3521e46b9bb1d08d184fa5"},
     {file = "sympy-1.12.tar.gz", hash = "sha256:ebf595c8dac3e0fdc4152c51878b498396ec7f30e7a914d6071e674d49420fb8"},
 ]
+
+[[package]]
+name = "tinycudann"
+version = "0.0.0"
+path = "../tiny-cuda-nn/bindings/torch"
+summary = ""
 
 [[package]]
 name = "torch"

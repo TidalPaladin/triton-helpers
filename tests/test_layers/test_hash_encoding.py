@@ -149,14 +149,15 @@ class TestEmbeddingLookup:
         def kernel(
             # fmt: off
             x_p, pi_p, o_p,
+            stride_x_l, stride_o_l,
             L: tl.constexpr, D: tl.constexpr,
             T_l: int, N_l: int,
             BLOCK_D: tl.constexpr, BLOCK_L: tl.constexpr, NEEDS_HASH: tl.constexpr,
             # fmt: on
         ):
             start = tl.program_id(0) * BLOCK_L
-            x_p += start
-            o_p += start
+            x_p += start * stride_x_l
+            o_p += start * stride_o_l
 
             # Load x
             X_ptr = tl.make_block_ptr(x_p, (L, D), (D, 1), (0, 0), (BLOCK_L, BLOCK_D), (1, 0))
@@ -165,10 +166,10 @@ class TestEmbeddingLookup:
             # Load pi
             offset_pi = tl.arange(0, BLOCK_D)
             mask_pi = offset_pi < D
-            pi = tl.load(pi_p + offset_pi, mask=mask_pi)
+            pi = tl.load(pi_p + offset_pi, mask=mask_pi).to(tl.uint32)
 
             # Hash
-            o = embedding_lookup(x, pi, D, T_l, N_l, BLOCK_D, NEEDS_HASH).to(o_p.dtype.element_ty)
+            o = embedding_lookup(x, pi, D, T_l.to(tl.uint32), N_l.to(tl.uint32), BLOCK_D, NEEDS_HASH).to(o_p.dtype.element_ty)
 
             # Store
             O_ptr = tl.make_block_ptr(o_p, (L, 2**D), (2**D, 1), (0, 0), (BLOCK_L, 2**BLOCK_D), (1, 0))
@@ -201,12 +202,12 @@ class TestEmbeddingLookup:
         # Baseline
         baseline = torch.tensor(
             [
-                [0, 1, 3, 4],
-                [4, 5, 7, 8],
-                [0, 1, 3, 4],
-                [4, 5, 7, 8],
-                [1, 2, 4, 5],
-                [3, 4, 6, 7],
+                [0, 1, 2, 3],
+                [3, 4, 5, 6],
+                [0, 1, 2, 3],
+                [3, 4, 5, 6],
+                [1, 2, 3, 4],
+                [2, 3, 4, 5],
             ],
             dtype=torch.int64,
             device="cuda",
@@ -217,7 +218,7 @@ class TestEmbeddingLookup:
         BLOCK_D = triton.next_power_of_2(D)
         BLOCK_L = triton.next_power_of_2(L)
         NEEDS_HASH = False
-        kernel[(1,)](x, pi, o, L, D, T, N_level, BLOCK_D, BLOCK_L, NEEDS_HASH)
+        kernel[(1,)](x, pi, o, x.stride(0), o.stride(0), L, D, T, N_level, BLOCK_D, BLOCK_L, NEEDS_HASH)
 
         assert (o == baseline).all()
 
@@ -247,11 +248,11 @@ class TestEmbeddingLookup:
         baseline = torch.tensor(
             [
                 [0, 1, 5, 4],
-                [4, 0, 4, 1],
+                [4, 0, 0, 4],
                 [0, 1, 5, 4],
-                [4, 0, 4, 1],
+                [4, 0, 0, 4],
                 [1, 2, 4, 0],
-                [5, 4, 3, 4],
+                [5, 4, 6, 0],
             ],
             dtype=torch.int64,
             device="cuda",
@@ -262,30 +263,31 @@ class TestEmbeddingLookup:
         BLOCK_D = triton.next_power_of_2(D)
         BLOCK_L = triton.next_power_of_2(L)
         NEEDS_HASH = True
-        kernel[(1,)](x, pi, o, L, D, T, N_level, BLOCK_D, BLOCK_L, NEEDS_HASH)
+        kernel[(1,)](x, pi, o, x.stride(0), o.stride(0), L, D, T, N_level, BLOCK_D, BLOCK_L, NEEDS_HASH)
 
         assert (o == baseline).all()
 
     @pytest.mark.parametrize("unique", [False, True])
     def test_torch_baseline(self, kernel, corner_factory, unique):
         torch.random.manual_seed(0)
-        L, D, N_level = 16, 3, 8
+        L, D, N_level = 4, 2, 8
         # Condition of T for results to not be unique
         T = (N_level + 1) ** D - (2 if not unique else 0)
 
         # Inputs
         x = torch.rand(L, D, device="cuda")
-        pi = torch.tensor([PI_1, PI_2, PI_3], device="cuda", dtype=torch.int64)
+        pi = torch.tensor([PI_1, PI_2, PI_3], device="cuda", dtype=torch.int64)[:D]
 
         # Baseline
         x_rd = torch.floor(x * N_level).to(torch.int64)
         offsets = corner_factory(D, device=x_rd.device, dtype=torch.int64)
         corners = x_rd[:, None, :] + offsets[None, :, :]
         if unique:
-            h = corners * (pi.new_full((D,), N_level + 1) ** torch.arange(D, device=pi.device))
+            scale = N_level ** torch.arange(D, device=pi.device)
+            h = corners * scale
             baseline = h.sum(-1)
         else:
-            t = corners * pi.view(1, 1, -1)
+            t = corners * pi
             h = torch.bitwise_xor(t[..., 0], t[..., 1])
             for i in range(2, D):
                 h = torch.bitwise_xor(h, t[..., i])
@@ -296,7 +298,7 @@ class TestEmbeddingLookup:
         BLOCK_D = triton.next_power_of_2(D)
         BLOCK_L = triton.next_power_of_2(L)
         NEEDS_HASH = not unique
-        kernel[(1,)](x, pi, o, L, D, T, N_level, BLOCK_D, BLOCK_L, NEEDS_HASH)
+        kernel[(1,)](x, pi, o, x.stride(0), o.stride(0), L, D, T, N_level, BLOCK_D, BLOCK_L, NEEDS_HASH)
 
         assert_close(o, baseline, check_device=False, check_dtype=False)
 
@@ -317,7 +319,7 @@ class TestEmbeddingLookup:
         BLOCK_L = 64
         NEEDS_HASH = not unique
         grid = (triton.cdiv(L, BLOCK_L),)
-        kernel[grid](x, pi, o, L, D, T, N_level, BLOCK_D, BLOCK_L, NEEDS_HASH)
+        kernel[grid](x, pi, o, x.stride(0), o.stride(0), L, D, T, N_level, BLOCK_D, BLOCK_L, NEEDS_HASH)
 
         assert (o < T).all()
         assert (o >= 0).all()

@@ -1,13 +1,16 @@
 import math
-from typing import Final
+from typing import Final, Dict, Any
 
 import torch
 import triton
 import triton.language as tl
 from torch import Tensor
 
-from triton_helpers.heuristics import PowerOfTwoHeuristic
-from triton_helpers.ops import to_tensor
+from triton_helpers.heuristics import PowerOfTwoHeuristic, SMHeuristic
+from triton_helpers.ops import to_tensor, high_low_mod
+from triton_helpers.constants import CACHE_STREAMING, WRITE_THROUGH
+
+from .helpers import compute_b, compute_embedding_counts, compute_resolutions, get_first_hash_level, seek_to_level_embeddings
 
 
 # Three primes chosen as in the paper, one prime per spatial dimension
@@ -92,7 +95,7 @@ def embedding_lookup(
     # Hash needed
     NEEDS_HASH: tl.constexpr,
     # Working dtype
-    DTYPE: tl.constexpr = tl.constexpr(tl.uint64),
+    DTYPE: tl.constexpr = tl.constexpr(tl.uint32),
     # fmt: on
 ) -> tl.tensor:
     r"""Looks up embedding indices for the hybercube corners about a spatial coordinate.
@@ -110,8 +113,12 @@ def embedding_lookup(
         x = tl.math.float2ull_rd(x * N_l)
     elif DTYPE is tl.int64:
         x = tl.math.float2ll_rd(x * N_l)
+    elif DTYPE is tl.uint32:
+        x = tl.math.float2uint_rd(x * N_l)
+    elif DTYPE is tl.int32:
+        x = tl.math.float2int_rd(x * N_l)
     else:
-        tl.static_assert(False, f"Hash must be either tl.int64 or tl.uint64")
+        tl.static_assert(False, "Hash must be either uint or int, 32 or 64")
 
     # Map x to 2**D vertices for each corner
     corners = x[:, None, :] + create_corner_offsets(BLOCK_D).to(DTYPE)
@@ -119,36 +126,51 @@ def embedding_lookup(
     # At coarse resolution hashing isn't needed, mapping is 1:1
     if not NEEDS_HASH:  # type: ignore
         # Scale dimension D_i by (N_l + 1) ** i (this is basically a stride)
-        scale = tl.math.pow(N_l * tl.full((BLOCK_D,), 1, tl.float32), tl.arange(0, BLOCK_D)).to(DTYPE)
-        scale = tl.where(tl.arange(0, BLOCK_D) < D, scale, to_tensor(0, DTYPE))
-        h = tl.sum(corners * scale[None, None, :], axis=2)
+        scale = tl.math.pow(N_l, tl.arange(0, BLOCK_D).to(tl.float32))
+        scale = tl.where(tl.arange(0, BLOCK_D) < D, scale, 0)
+        h = tl.sum(corners * scale.to(DTYPE)[None, None, :], axis=2)
+
     # Otherwise compute hash function
     else:
-        h = tl.xor_sum(corners * pi[None, None, :].to(DTYPE), axis=2) % T_l.to(DTYPE)
+        # Must be mindful of overlow of uint32, but using uint64 for everything is too slow.
+        # First compute the high and low 32 bits of the uint32 product xor
+        low = tl.xor_sum(corners * pi[None, None, :], 2)
+        high = tl.xor_sum(tl.math.mulhi(corners, pi[None, None, :]), 2)
+
+        #h = ((high.to(tl.uint64) << 32) | low.to(tl.uint64)) % T_l
+        #h = h.to(DTYPE)
+
+        h = high_low_mod(high, low, T_l)
+
+        
+
 
     tl.device_assert((h < T_l) & (h >= 0), f"Embedding index out of bounds")
     return h
 
 
-def get_b(args) -> int:
-    return int(math.exp((math.log(args["MAX_RES"]) - math.log(args["MIN_RES"])) / (args["L"] - 1)))
+def _compute_b(args: Dict[str, Any]) -> int:
+    return compute_b(args["MIN_RES"], args["MAX_RES"], args["L"])
 
 
-def get_first_hash_level(args) -> int:
-    MIN_RES, MAX_RES, L, T = args["MIN_RES"], args["MAX_RES"], args["L"], args["T"]
-    resolutions = compute_resolutions(L, MIN_RES, MAX_RES)
-    t_i = (resolutions + 1) ** 2
-    return int((t_i > T).int().argmax())
+def _get_first_hash_level(args: Dict[str, Any]) -> int:
+    return get_first_hash_level(args["MIN_RES"], args["MAX_RES"], args["L"], args["T"])
 
 
+@triton.autotune(configs=[
+    triton.Config({"BLOCK_N": 64}, num_warps=4),
+    triton.Config({"BLOCK_N": 64}, num_warps=8),
+    triton.Config({"BLOCK_N": 128}, num_warps=4),
+    triton.Config({"BLOCK_N": 128}, num_warps=8),
+    triton.Config({"BLOCK_N": 256}, num_warps=8),
+    triton.Config({"BLOCK_N": 256}, num_warps=16),
+], key=["D", "F", "L", "T", "MIN_RES", "MAX_RES"])
 @triton.heuristics(
     values={
-        "BLOCK_N": PowerOfTwoHeuristic("N", max_val=64),
         "BLOCK_D": PowerOfTwoHeuristic("D"),
         "BLOCK_F": PowerOfTwoHeuristic("F"),
-        "B": get_b,
-        "FIRST_HASH_LEVEL": get_first_hash_level,
-        "num_warps": lambda _: 2,
+        "B": _compute_b,
+        "FIRST_HASH_LEVEL": _get_first_hash_level,
     }
 )
 @triton.jit
@@ -168,11 +190,12 @@ def _fwd_kernel(
     BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_F: tl.constexpr,
     # Derived parameters
     B: tl.constexpr, FIRST_HASH_LEVEL: tl.constexpr,
+    # Dtypes
+    INT_DTYPE: tl.constexpr = tl.uint32,
     # fmt: on
 ):
     # Set pointers to this program's start
-    l = tl.program_id(0) 
-    start = tl.program_id(1) * BLOCK_N
+    start = tl.program_id(0) * BLOCK_N
     x_p += start * stride_x_n
     o_p += start * stride_o_n
 
@@ -190,39 +213,44 @@ def _fwd_kernel(
     # Load pi
     offsets = tl.arange(0, BLOCK_D)
     mask = offsets < D
-    pi = tl.load(pi_p + offsets, mask=mask, eviction_policy="evict_last")
+    pi = tl.load(pi_p + offsets, mask=mask, eviction_policy="evict_last").to(INT_DTYPE)
 
+    # Iterate over hash table levels
+    # NOTE: It is empirically faster to run this as a static range, accumulate into a single buffer,
+    # and then do one write at the end. The expectation is that this table will be used with a fully
+    # fused MLP, in which case L * F should be small (typically 32) and fit fully in SRAM.
+    o = tl.zeros((BLOCK_N, L, BLOCK_F), dtype=o_p.dtype.element_ty)
+    for l in tl.static_range(L):
+        # Resolution and number of array entries for this level
+        N_l = tl.math.mul_rd(MIN_RES, tl.math.pow(to_tensor(B, tl.float32), l)).to(INT_DTYPE)
+        T_l = tl.minimum(tl.math.pow((N_l + 1), to_tensor(D, tl.float32)), T).to(INT_DTYPE)
+
+        # Look up embeddings
+        embedding_idx = embedding_lookup(x, pi, D, T_l, N_l, BLOCK_D, l >= FIRST_HASH_LEVEL, INT_DTYPE)
+        embedding_idx = (embedding_idx * F)[:, :, None] + tl.arange(0, BLOCK_F).to(INT_DTYPE)[None, None, :]
+        emb_mask = tl.arange(0, BLOCK_F) < F
+        e = tl.load(e_p + embedding_idx, mask=emb_mask[None, None, :])
+
+        # Interpolate embeddings
+        e = interpolate(x, e, D, BLOCK_D)[:, None, :]
+
+        # Update output
+        mask = tl.arange(0, L) == l
+        o = tl.where(mask[None, :, None], e, o)
+
+        # Advance pointers
+        e_p += T_l * stride_e_t
+
+    o = tl.view(o, (BLOCK_N, L * BLOCK_F))
     O_block_ptr = tl.make_block_ptr(
         o_p,
         (N, L*F),
         (stride_o_n, stride_o_f),
-        (0, l),
-        (BLOCK_N, BLOCK_F),
+        (0, 0),
+        (BLOCK_N, L*BLOCK_F),
         (1, 0),
     )
-
-    # Iterate over hash table levels
-    for l in tl.static_range(L):
-        # Resolution and number of array entries for this level
-        N_l = tl.math.mul_rd(MIN_RES, tl.math.pow(to_tensor(B, tl.float32), l)).to(tl.uint32)
-        T_l = tl.minimum(tl.math.pow((N_l + 1), to_tensor(D, tl.float32)), T).to(tl.uint32)
-
-        # Look up embeddings
-        embedding_idx = embedding_lookup(x, pi, D, T_l, N_l, BLOCK_D, l >= FIRST_HASH_LEVEL)
-        embedding_idx = (embedding_idx * F)[:, :, None] + tl.arange(0, BLOCK_F)[None, None, :]
-        emb_mask = tl.arange(0, BLOCK_F) < F
-        e = tl.load(e_p + embedding_idx, mask=emb_mask[None, None, :], eviction_policy="evict_last")
-
-        # Interpolate embeddings
-        e = interpolate(x, e, D, BLOCK_D)
-
-        # Write features to output
-        tl.store(O_block_ptr, e, boundary_check=( 0, 1,), eviction_policy="evict_first")
-
-        # Advance pointers
-        if l < L - 1:
-            O_block_ptr = tl.advance(O_block_ptr, (0, BLOCK_F))
-            e_p += T_l * stride_e_t
+    tl.store(O_block_ptr, o, boundary_check=( 0, 1,))
 
 
 @triton.heuristics(
@@ -315,18 +343,6 @@ def _bwd_kernel(
         de_p += T_l * stride_de_t
 
 
-def compute_resolutions(num_levels: int, min_res: int, max_res: int) -> Tensor:
-    b = torch.tensor(math.exp((math.log(max_res) - math.log(min_res)) / (num_levels - 1)))
-    l = torch.arange(0, num_levels)
-    return b.pow(l).mul(min_res).floor().long()
-
-
-def compute_embedding_counts(num_levels: int, max_entries_per_level: int, min_res: int, max_res: int) -> Tensor:
-    resolutions = compute_resolutions(num_levels, min_res, max_res)
-    t = (resolutions + 1) ** 2
-    return torch.min(t, t.new_tensor(max_entries_per_level))
-
-
 class HashEncoding(torch.autograd.Function):
 
     @torch.cuda.amp.custom_fwd(cast_inputs=torch.float16)
@@ -389,7 +405,7 @@ class HashEncoding(torch.autograd.Function):
         o = embeddings.new_empty(*out_shape)
 
         def grid(META):
-            return (1, triton.cdiv(L, META["BLOCK_N"]),)
+            return (triton.cdiv(L, META["BLOCK_N"]),)
 
         _fwd_kernel[grid](  # type: ignore
             # fmt: off
