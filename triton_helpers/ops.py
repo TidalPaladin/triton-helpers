@@ -55,6 +55,28 @@ def silu_bwd(x: tl.tensor, grad: tl.tensor) -> tl.tensor:
     return grad * s * (x * (1 - s) + 1)
 
 
+@triton.jit
+def high_low_mod(high: tl.tensor, low: tl.tensor, m: tl.tensor) -> tl.tensor:
+    r"""Computes a modulo from the high and low bits of an integer and m."""
+    # H = (high * B + low) % m
+    #   = ((high * B) % m + low % m) % m
+    #   = ([(high % m) * (B % m)] % m) % m + low % m) % m
+    # NOTE: Offset of 1 seems necessary to prevent overflow in temporary base
+    SHIFT: tl.constexpr = (1 << tl.constexpr(high.dtype.int_bitwidth)) - 1
+    base = (to_tensor(SHIFT, m.dtype) % m + to_tensor(1, m.dtype)) % m
+    high_mod = (high % m) * (base % m)
+    low_mod = low % m
+    return (high_mod + low_mod) % m
+
+
+@triton.jit
+def multiply_mod(x: tl.tensor, y: tl.tensor, m: tl.tensor) -> tl.tensor:
+    r"""Computes (x * y) % m for integer tensors x, y, and m."""
+    low = x * y
+    high = tl.math.mulhi(x, y)
+    return high_low_mod(high, low, m)
+
+
 def ensure_str(fn: str | triton.JITFunction, choices: Iterable[str] | None = None) -> str:
     r"""Ensure a function is a string, optionally checking it against a set of choices.
 
