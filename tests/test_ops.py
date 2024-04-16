@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 from torch.testing import assert_close
 
-from triton_helpers.ops import diag, norm_coeff, offset_grid, relu, relu_bwd, silu, silu_bwd, to_tensor
+from triton_helpers.ops import diag, multiply_mod, norm_coeff, offset_grid, relu, relu_bwd, silu, silu_bwd, to_tensor
 
 
 @pytest.mark.cuda
@@ -173,3 +173,32 @@ def test_silu_bwd(dtype, tol):
     baseline = i.grad
     kernel[(1,)](i, do, o, M)  # type: ignore
     assert_close(o, baseline, atol=tol, rtol=0)
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize(
+    "dtype, triton_dtype, x, y, m, exp",
+    [
+        (torch.int32, tl.int32, 1, 10, 7, (1 * 10) % 7),
+        (torch.int32, tl.int32, 2**10, 2**10, 2**5, (2**10 * 2**10) % 2**5),
+        (torch.int32, tl.uint32, 1, 10, 7, (1 * 10) % 7),
+        (torch.int32, tl.uint32, 2**10, 2**10, 2**5, (2**10 * 2**10) % 2**5),
+        (torch.int64, tl.uint32, 2_654_435_761, 8, 700, (2_654_435_761 * 8) % 700),
+    ],
+)
+def test_multiply_mod(dtype, triton_dtype, x, y, m, exp):
+    @triton.jit
+    def kernel(x_p, y_p, m_p, o_p, DTYPE: tl.constexpr):  # type: ignore
+        x = tl.load(x_p + tl.arange(0, 1)).to(DTYPE)
+        y = tl.load(y_p + tl.arange(0, 1)).to(DTYPE)
+        m = tl.load(m_p + tl.arange(0, 1)).to(DTYPE)
+        z = multiply_mod(x, y, m)
+        tl.store(o_p + tl.arange(0, 1), z.to(o_p.dtype.element_ty))
+
+    x = torch.tensor(x, dtype=dtype, device="cuda")
+    y = x.new_tensor(y)
+    m = x.new_tensor(m)
+    o = x.new_empty(1)
+    kernel[(1,)](x, y, m, o, triton_dtype)  # type: ignore
+
+    assert o.item() == exp
