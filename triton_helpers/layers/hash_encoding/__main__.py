@@ -33,6 +33,7 @@ class TinyCudaNN(KernelExecutor):
         }
         device = kwargs.get("device", "cuda")
         module = Encoding(D, config, dtype=kwargs.get("dtype", torch.float32)).to(device)
+        torch.random.manual_seed(0)
         x = self.rand((32, L, D), **kwargs)
         return {
             "x": x,
@@ -48,6 +49,7 @@ class Triton(KernelExecutor):
 
     @torch.no_grad()
     def prepare_inputs(self, L: int, D: int, F: int, T: int, N: int, X: int, Y: int, **kwargs) -> Dict[str, Tensor | None]:
+        torch.random.manual_seed(0)
         x = self.rand((32, L, D), **kwargs)
         layer = HashEncoding(T, N, F, X, Y).to(x.device)
         dtype = kwargs.get("dtype", torch.float32)

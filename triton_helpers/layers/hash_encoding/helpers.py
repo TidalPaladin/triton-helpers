@@ -1,4 +1,5 @@
 import torch
+import sys
 import math
 from typing import List
 from torch import Tensor
@@ -60,8 +61,12 @@ def get_first_hash_level(N_min: int, N_max: int, L: int, T: int) -> int:
         The first table level where the number of embeddings exceeds the size of the table,
         satisfying ``0 <= result < L``.
     """
-    t_i = torch.tensor(compute_embedding_counts(L, T, N_min, N_max))
-    return int((t_i > T).int().argmax())
+    t_i = torch.tensor(compute_embedding_counts(L, sys.maxsize, N_min, N_max))
+    needs_hash = (t_i > T)
+    if not needs_hash.any():
+        return L+1
+    return int(needs_hash.int().argmax())
+
 
 
 def seek_to_level_embeddings(e: Tensor, l_i: int, L: int, T: int, N_min: int, N_max: int) -> Tensor:

@@ -1,6 +1,6 @@
 from typing import Final
 
-# https://docs.nvidia.com/cuda/parallel-thread-execution/index.html?highlight=write%20through#cache-operators
+# https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#cache-operators
 CACHE_ALL: Final = ".ca"        
 CACHE_GLOBAL: Final = ".cg"     
 CACHE_STREAMING: Final = ".cs"  
