@@ -1,15 +1,15 @@
+import math
 from dataclasses import dataclass
-from typing import Dict, Any
+from typing import Any, Dict
 
 import torch
 import torch.nn as nn
-import math
-import torch.nn.functional as F
 from torch import Tensor
 
 from ...benchmark import CLI, KernelExecutor
 from .kernel import hash_encoding
 from .module import HashEncoding
+
 
 try:
     from tinycudann.modules import Encoding
@@ -21,6 +21,7 @@ except ImportError:
 class TinyCudaNN(KernelExecutor):
 
     def prepare_inputs(self, L: int, D: int, F: int, T: int, N: int, X: int, Y: int, **kwargs) -> Dict[str, Any]:
+        assert Encoding is not None, f"{self.__class__.__name__} requires TinyCudaNN to be installed."
         config = {
             "otype": "Grid",
             "type": "Hash",
@@ -29,7 +30,7 @@ class TinyCudaNN(KernelExecutor):
             "log2_hashmap_size": int(math.log2(T)),
             "base_resolution": X,
             "per_level_scale": math.log2(Y // X),
-            "interpolation": "Linear"
+            "interpolation": "Linear",
         }
         device = kwargs.get("device", "cuda")
         module = Encoding(D, config, dtype=kwargs.get("dtype", torch.float32)).to(device)
@@ -48,7 +49,9 @@ class TinyCudaNN(KernelExecutor):
 class Triton(KernelExecutor):
 
     @torch.no_grad()
-    def prepare_inputs(self, L: int, D: int, F: int, T: int, N: int, X: int, Y: int, **kwargs) -> Dict[str, Tensor | None]:
+    def prepare_inputs(
+        self, L: int, D: int, F: int, T: int, N: int, X: int, Y: int, **kwargs
+    ) -> Dict[str, Tensor | None]:
         torch.random.manual_seed(0)
         x = self.rand((32, L, D), **kwargs)
         layer = HashEncoding(T, N, F, X, Y).to(x.device)

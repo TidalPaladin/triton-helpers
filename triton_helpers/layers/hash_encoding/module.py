@@ -16,10 +16,8 @@ class HashEncoding(nn.Module):
         max_res: int = 512,
     ):
         super().__init__()
-        t = compute_embedding_counts(num_levels, max_entries_per_level, min_res, max_res)
-        self.embeddings = nn.Parameter(
-            torch.cat([torch.randn(int(t[i]), dim) for i in range(num_levels)], dim=0)
-        )
+        t = compute_embedding_counts(num_levels, max_entries_per_level, dim, min_res, max_res)
+        self.embeddings = nn.Parameter(torch.cat([torch.randn(int(t[i]), dim) for i in range(num_levels)], dim=0))
         self.register_buffer("pi", torch.tensor([PI_1, PI_2, PI_3], dtype=torch.int64))
         self.max_entries_per_level = max_entries_per_level
         self.num_levels = num_levels

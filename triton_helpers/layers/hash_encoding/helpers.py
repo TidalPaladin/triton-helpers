@@ -1,7 +1,8 @@
-import torch
-import sys
 import math
+import sys
 from typing import List
+
+import torch
 from torch import Tensor
 
 
@@ -26,7 +27,7 @@ def compute_resolutions(num_levels: int, N_min: int, N_max: int) -> List[int]:
         num_levels: Number of table levels.
         N_min: Resolution of the coarsest table level.
         N_max: Resolution of the finest table level.
-    
+
     Returns:
         List of resolutions of the table levels.
     """
@@ -35,12 +36,13 @@ def compute_resolutions(num_levels: int, N_min: int, N_max: int) -> List[int]:
     return b.pow(l).mul(N_min).floor().long().tolist()
 
 
-def compute_embedding_counts(L: int, T: int, N_min: int, N_max: int) -> List[int]:
+def compute_embedding_counts(L: int, T: int, D: int, N_min: int, N_max: int) -> List[int]:
     r"""Computes the number of embeddings per table level.
 
     Args:
         L: Number of table levels.
         T: Maximum number of entries per table level.
+        D: Coordinate dimension.
         N_min: Resolution of the coarsest table level.
         N_max: Resolution of the finest table level.
 
@@ -48,28 +50,27 @@ def compute_embedding_counts(L: int, T: int, N_min: int, N_max: int) -> List[int
         List of the number of embeddings per table level.
     """
     resolutions = torch.tensor(compute_resolutions(L, N_min, N_max))
-    t = (resolutions + 1) ** 2
+    t = (resolutions + 1) ** D
     return torch.min(t, t.new_tensor(T)).tolist()
 
 
-def get_first_hash_level(N_min: int, N_max: int, L: int, T: int) -> int:
+def get_first_hash_level(N_min: int, N_max: int, L: int, T: int, D: int) -> int:
     r"""Computes the first table level where the number of embeddings exceeds the size of the table.
 
     This is the first level at which a hash function will be needed.
-    
+
     Returns:
         The first table level where the number of embeddings exceeds the size of the table,
         satisfying ``0 <= result < L``.
     """
-    t_i = torch.tensor(compute_embedding_counts(L, sys.maxsize, N_min, N_max))
-    needs_hash = (t_i > T)
+    t_i = torch.tensor(compute_embedding_counts(L, sys.maxsize, D, N_min, N_max))
+    needs_hash = t_i > T
     if not needs_hash.any():
-        return L+1
+        return L + 1
     return int(needs_hash.int().argmax())
 
 
-
-def seek_to_level_embeddings(e: Tensor, l_i: int, L: int, T: int, N_min: int, N_max: int) -> Tensor:
+def seek_to_level_embeddings(e: Tensor, l_i: int, L: int, T: int, D: int, N_min: int, N_max: int) -> Tensor:
     r"""Given a dense set of embeddings, returns a view of the embeddings at a specific table level.
 
     Args:
@@ -77,6 +78,7 @@ def seek_to_level_embeddings(e: Tensor, l_i: int, L: int, T: int, N_min: int, N_
         l_i: Table level index.
         L: Number of table levels.
         T: Maximum number of entries per table level.
+        D: Coordinate dimension.
         N_min: Resolution of the coarsest table level.
         N_max: Resolution of the finest table level.
 
@@ -87,8 +89,7 @@ def seek_to_level_embeddings(e: Tensor, l_i: int, L: int, T: int, N_min: int, N_
     Returns:
         View of the embeddings at the specified table level.
     """
-    size = compute_embedding_counts(L, T, N_min, N_max)
+    size = compute_embedding_counts(L, T, D, N_min, N_max)
     start = [0] + torch.cumsum(torch.tensor(size), 0).tolist()
     end = start[1:]
-    return e[..., start[l_i]:end[l_i], :]
-    
+    return e[..., start[l_i] : end[l_i], :]
