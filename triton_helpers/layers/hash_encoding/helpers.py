@@ -1,12 +1,13 @@
 import math
 import sys
-from typing import List
+from typing import List, Final
 
 import torch
 from torch import Tensor
 
+EPS: Final = 1e-5
 
-def compute_b(N_min: int, N_max: int, L: int) -> int:
+def compute_b(N_min: int, N_max: int, L: int) -> float:
     r"""Computes the base of the geometric progression of resolutions.
 
     Args:
@@ -17,7 +18,7 @@ def compute_b(N_min: int, N_max: int, L: int) -> int:
     Returns:
         The base of the geometric progression of resolutions.
     """
-    return int(math.exp((math.log(N_max) - math.log(N_min)) / (L - 1)))
+    return float(math.exp((math.log(N_max) - math.log(N_min)) / (L - 1))) + EPS
 
 
 def compute_resolutions(num_levels: int, N_min: int, N_max: int) -> List[int]:
@@ -31,7 +32,7 @@ def compute_resolutions(num_levels: int, N_min: int, N_max: int) -> List[int]:
     Returns:
         List of resolutions of the table levels.
     """
-    b = torch.tensor(math.exp((math.log(N_max) - math.log(N_min)) / (num_levels - 1)))
+    b = torch.tensor(compute_b(N_min, N_max, num_levels))
     l = torch.arange(0, num_levels)
     return b.pow(l).mul(N_min).floor().long().tolist()
 
@@ -93,3 +94,20 @@ def seek_to_level_embeddings(e: Tensor, l_i: int, L: int, T: int, D: int, N_min:
     start = [0] + torch.cumsum(torch.tensor(size), 0).tolist()
     end = start[1:]
     return e[..., start[l_i] : end[l_i], :]
+
+
+def compute_level_embedding_offset(l_i: int, L: int, T: int, D: int, N_min: int, N_max: int) -> int:
+    r"""Compute the offset of the embeddings at a specific table level.
+
+    Args:
+        l_i: Table level index.
+        L: Number of table levels.
+        T: Maximum number of entries per table level.
+        D: Coordinate dimension.
+        N_min: Resolution of the coarsest table level.
+        N_max: Resolution of the finest table level.
+
+    """
+    size = compute_embedding_counts(L, T, D, N_min, N_max)
+    start = [0] + torch.cumsum(torch.tensor(size), 0).tolist()
+    return start[l_i]

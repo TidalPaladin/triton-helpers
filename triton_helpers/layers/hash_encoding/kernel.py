@@ -1,13 +1,14 @@
 import math
-from typing import Any, Dict, Final
+import sys
+from typing import Any, Dict, Final, Tuple
 
 import torch
 import triton
 import triton.language as tl
 from torch import Tensor
 
-from triton_helpers.heuristics import PowerOfTwoHeuristic
-from triton_helpers.ops import high_low_mod
+from triton_helpers.heuristics import PowerOfTwoHeuristic, SMHeuristic
+from triton_helpers.ops import high_low_mod, to_tensor
 
 from .helpers import (
     compute_b,
@@ -15,6 +16,7 @@ from .helpers import (
     compute_resolutions,
     get_first_hash_level,
     seek_to_level_embeddings,
+    compute_level_embedding_offset,
 )
 
 
@@ -36,7 +38,13 @@ def create_corner_offsets(BLOCK: tl.constexpr) -> tl.tensor:
     Shape:
         (2**BLOCK, BLOCK)
     """
-    return (tl.arange(0, 2**BLOCK)[:, None] >> tl.arange(0, BLOCK)[None, :]) & 1
+    tl.static_assert(BLOCK <= 32, "BLOCK must be <= 32")
+    result = (tl.arange(0, 2**BLOCK)[:, None] >> tl.arange(0, BLOCK)[None, :]) & 1
+    if BLOCK <= 8:
+        result = result.to(tl.uint8)
+    elif BLOCK <= 16:
+        result = result.to(tl.uint16)
+    return result
 
 
 @triton.jit
@@ -46,14 +54,9 @@ def get_interpolation_weights(x: tl.tensor, D: tl.constexpr, BLOCK: tl.constexpr
     Shape:
         (N, 2**BLOCK)
     """
-    # Get corner of x hypercube
-    x_rd = tl.math.float2int_rd(x).to(x.dtype)
-
-    # Get corner offsets (1, 2**D, D)
-    corner_offsets = create_corner_offsets(BLOCK)[None, :, :]
-
     # Compute interpolation weights (N, 2**D, 1)
-    w = (x - x_rd)[:, None, :]
+    w = tl.math.fmod(x, 1.0)[:, None, :]
+    corner_offsets = create_corner_offsets(BLOCK)[None, :, :]
     w = tl.where(corner_offsets == 0, 1 - w, w)
 
     # Set out of bounds weights along last dim to 1 and product reduce along last dim
@@ -74,18 +77,7 @@ def interpolate(x: tl.tensor, e: tl.tensor, D: tl.constexpr, BLOCK_D: tl.constex
         (N, F)
     """
     w = get_interpolation_weights(x, D, BLOCK_D)[:, :, None]
-    return tl.sum(w * e, axis=1).to(e.dtype)
-
-
-@triton.jit
-def interpolate_bwd(
-    x: tl.tensor, do: tl.tensor, D: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_F: tl.constexpr
-) -> tl.tensor:
-    # Recompute the interpolation weights (N, 2**D, F)
-    w = get_interpolation_weights(x, D, BLOCK_D)[:, :, None] + tl.arange(0, BLOCK_F)[None, None, :]
-
-    # Compute de (N, 2**D, F)
-    de = do[:, None, :] * w
+    return tl.sum(w.to(e.dtype) * e, axis=1).to(e.dtype)
 
 
 @triton.jit
@@ -99,9 +91,9 @@ def embedding_lookup(
     BLOCK_D: tl.constexpr,
     # Hash needed
     NEEDS_HASH: tl.constexpr,
-    T_POW_2: tl.constexpr = tl.constexpr(False),
+    T_POW_2: tl.constexpr = False,
     # Working dtype
-    DTYPE: tl.constexpr = tl.constexpr(tl.uint32),
+    DTYPE: tl.constexpr = tl.uint32,
     # fmt: on
 ) -> tl.tensor:
     r"""Looks up embedding indices for the hybercube corners about a spatial coordinate.
@@ -114,31 +106,29 @@ def embedding_lookup(
     # outputs will be silently wrong with little indication of why.
     # NOTE: Be very careful with truncation and casting. Everything needs to use uint32, but it's
     # easy to overflow in intermediate products.
+    tl.static_assert(DTYPE is tl.uint32, f"Hash dtype must be uint32, got {DTYPE}")
     tl.device_assert((x >= 0), "x must be non-negative")
-    tl.device_assert((x < N_l), "x must be less than N_l")
+    tl.device_assert((x <= N_l), "x must be less than N_l")
     tl.device_assert((T_l < 2**32), "T_l must be less than 2**32")
     tl.device_assert((N_l < 2**32), "N_l must be less than 2**32")
     tl.device_assert(
-        (tl.math.pow((N_l + 1.0).to(tl.float64), D) > T_l) == NEEDS_HASH, "Hashing condition set incorrectly"
+        (tl.math.pow((N_l + 1.0).to(tl.float64), D) > T_l) == NEEDS_HASH, 
+        f"Hashing condition set incorrectly, hash={NEEDS_HASH}"
     )
 
-    # Scale x by this level's resolution and round down to get the lower corner
-    # TODO: Should probably change this to support only uint32
-    if DTYPE is tl.uint64:
-        x = tl.math.float2ull_rd(x)
-    elif DTYPE is tl.uint32:
-        x = tl.math.float2uint_rd(x)
-    else:
-        tl.static_assert(False, "Hash must be either uint or int, 32 or 64")
+    # Round x down by casting to uint type
+    x = x.to(DTYPE)
 
     # Map x to 2**D vertices for each corner
-    corners = x[:, None, :] + create_corner_offsets(BLOCK_D).to(DTYPE)
+    corners = x[:, None, :] + (create_corner_offsets(BLOCK_D) & (2**D - 1)).to(DTYPE)
 
     # At coarse resolution hashing isn't needed, mapping is 1:1
     if not NEEDS_HASH:  # type: ignore
         # Scale dimension D_i by (N_l + 1) ** i (this is basically a stride)
         scale = tl.math.pow(N_l, tl.arange(0, BLOCK_D).to(tl.float32))
         scale = tl.where(tl.arange(0, BLOCK_D) < D, scale, 0)
+        # Float precision can be an issue - round instead of truncating
+        scale = tl.math.float2uint_rn(scale)
         h = tl.sum(corners * scale.to(DTYPE)[None, None, :], axis=2)
 
     # Otherwise compute hash function
@@ -157,34 +147,16 @@ def embedding_lookup(
     return h
 
 
-def _compute_b(args: Dict[str, Any]) -> int:
-    return compute_b(args["MIN_RES"], args["MAX_RES"], args["L"])
-
-
-def _get_first_hash_level(args: Dict[str, Any]) -> int:
-    result = get_first_hash_level(args["MIN_RES"], args["MAX_RES"], args["L"], args["T"], args["D"])
-    return result
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_N": 64}, num_warps=4),
-        triton.Config({"BLOCK_N": 64}, num_warps=8),
-        triton.Config({"BLOCK_N": 128}, num_warps=4),
-        triton.Config({"BLOCK_N": 128}, num_warps=8),
-        triton.Config({"BLOCK_N": 256}, num_warps=4),
-        triton.Config({"BLOCK_N": 256}, num_warps=8),
-        triton.Config({"BLOCK_N": 256}, num_warps=16),
-    ],
-    key=["D", "F", "L", "T", "MIN_RES", "MAX_RES"],
-)
 @triton.heuristics(
     values={
         "BLOCK_D": PowerOfTwoHeuristic("D"),
         "BLOCK_F": PowerOfTwoHeuristic("F"),
-        # "BLOCK_N": PowerOfTwoHeuristic("N", min_val=16, max_val=16),
-        "B": _compute_b,
-        "FIRST_HASH_LEVEL": _get_first_hash_level,
+        "BLOCK_N": SMHeuristic("x_p", "N", max_size=512),
+        "num_warps": lambda args: 16 if args["BLOCK_N"] == 512 else 8 if args["BLOCK_N"] >= 128 else 4,
+        "HASH_LEVEL": lambda args: get_first_hash_level(args["MIN_RES"], args["MAX_RES"], args["L"], args["T"], args["D"]),
+        "B": lambda args: compute_b(args["MIN_RES"], args["MAX_RES"], args["L"]),
+        "E_START": lambda args: compute_level_embedding_offset(args.get("START_L", 0), args["L"], args["T"], args["D"], args["MIN_RES"], args["MAX_RES"]),
+        "SYNCHRONIZE": lambda _: True,
     }
 )
 @triton.jit
@@ -200,24 +172,32 @@ def _fwd_kernel(
     N: int, D: tl.constexpr, F: tl.constexpr,
     # Hash parameters
     T: tl.constexpr, L: tl.constexpr, MIN_RES: tl.constexpr, MAX_RES: tl.constexpr,
+    # Operating range and optimization
+    START_L: tl.constexpr, END_L: tl.constexpr, SYNCHRONIZE: tl.constexpr,
     # Block sizes
     BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_F: tl.constexpr,
-    # Derived parameters
-    B: tl.constexpr, FIRST_HASH_LEVEL: tl.constexpr,
-    # Dtypes
-    INT_DTYPE: tl.constexpr = tl.uint32,
+    # Derived
+    HASH_LEVEL: tl.constexpr, B: tl.constexpr, E_START: tl.constexpr,
     # fmt: on
 ):
     # Input validation and constant setup
-    tl.static_assert(
-        FIRST_HASH_LEVEL > 0, "Hashing requested at first level, this indicates a bug or poor table parameters"
-    )
     T_POW_2: tl.constexpr = T & (T - 1) == 0
+    INT_DTYPE: tl.constexpr = tl.uint32
+    tl.static_assert(B > 1, f"B must be greater than 1, got B={B}")
+    tl.static_assert(START_L < L, f"START_L={START_L} must be less than L={L}")
+    tl.static_assert(START_L < END_L, f"START_L={START_L} must be less than END_L={END_L}")
+    LOOP_SIZE: tl.constexpr = END_L - START_L if END_L < L else L - START_L
+    ANY_HASH: tl.constexpr = HASH_LEVEL < START_L + LOOP_SIZE
+    tl.static_assert(START_L + LOOP_SIZE <= L, "Loop size exceeds L")
+    tl.static_assert(0 <= E_START, "E_START must be non-negative")
+    tl.static_assert(LOOP_SIZE & (LOOP_SIZE - 1) == 0, "Loop size must be a power of 2")
 
     # Set pointers to this program's start
     start = tl.program_id(0) * BLOCK_N
+    # Seek embedding pointer to match the starting level
+    e_p += E_START * stride_e_t
 
-    # Load input
+    # Load input and apply initial scale
     X_block_ptr = tl.make_block_ptr(
         x_p,
         (N, D),
@@ -227,85 +207,95 @@ def _fwd_kernel(
         (1, 0),
     )
     x = tl.load(X_block_ptr, boundary_check=(0, 1))
+    tl.device_assert(x >= 0, "x must be non-negative")
+    tl.device_assert(x <= 1, "x must be less than 1")
+    INITIAL_SCALE: tl.constexpr = int(MIN_RES * B ** START_L)
+    x *= to_tensor(INITIAL_SCALE, x.dtype)
 
-    # Load pi
-    offsets = tl.arange(0, BLOCK_D)
-    mask = offsets < D
-    pi = tl.load(pi_p + offsets, mask=mask).to(INT_DTYPE)
+    # Load pi if it will be needed
+    if ANY_HASH:
+        offsets = tl.arange(0, BLOCK_D)
+        mask = offsets < D
+        pi = tl.load(pi_p + offsets, mask=mask, eviction_policy="evict_last").to(INT_DTYPE)
+    else:
+        pi = tl.arange(0, BLOCK_D).to(INT_DTYPE)
 
     # Iterate over hash table levels
     # NOTE: It is empirically faster to run this as a static range, accumulate into a single buffer,
     # and then do one write at the end. The expectation is that this table will be used with a fully
     # fused MLP, in which case L * F should be small (typically 32 for L=16, F=2) and fit fully in SRAM.
-    N_l_prev = tl.constexpr(1)
-    o = tl.zeros((BLOCK_N, L, BLOCK_F), dtype=o_p.dtype.element_ty)
-    for l in tl.static_range(L):
+    o = tl.zeros((BLOCK_N, LOOP_SIZE, BLOCK_F), dtype=o_p.dtype.element_ty)
+    for l in tl.static_range(START_L, START_L + LOOP_SIZE):
         # Resolution and number of array entries for this level
-        N_l = tl.constexpr(MIN_RES * B**l)
-        T_l = tl.constexpr(min((MIN_RES * B**l + 1) ** D, T))
+        N_l = tl.constexpr(int(MIN_RES * B**l))
+        T_l = tl.constexpr(min((tl.constexpr(int(MIN_RES * B**l)) + 1) ** D, T))
+        N_l = N_l.to(tl.uint32)
+        T_l = T_l.to(tl.uint32)
 
-        # Apply scaling to x
-        X_SCALE = tl.constexpr(N_l // N_l_prev)
-        x = x * X_SCALE
-        N_l_prev = tl.constexpr(N_l)
+        # Scale x for this level
+        if l > START_L:
+            N_l_prev = tl.constexpr(int(MIN_RES * B**(l-1)))
+            scale = N_l.to(x.dtype) / N_l_prev.to(x.dtype)
+            x *= scale.to(x.dtype)
+        tl.static_assert(tl.constexpr(x.dtype) is tl.constexpr(x_p.dtype.element_ty), "x dtype should not change")
 
         # Look up embeddings
-        embedding_idx = embedding_lookup(x, pi, D, T_l, N_l, BLOCK_D, l >= FIRST_HASH_LEVEL, T_POW_2, INT_DTYPE)
-        embedding_idx = (embedding_idx * F)[:, :, None] + tl.arange(0, BLOCK_F).to(INT_DTYPE)[None, None, :]
+        if l >= HASH_LEVEL:
+            tl.device_assert(T_l >= T, "T_l should be >= T when hashing")
+            embedding_idx = embedding_lookup(x, pi, D, T_l, N_l, BLOCK_D, True, T_POW_2, INT_DTYPE)
+            embedding_idx = (embedding_idx * F)[:, :, None] + tl.arange(0, BLOCK_F).to(tl.uint8)[None, None, :]
+        else:
+            tl.device_assert(T_l < T, "T_l should be < T when not hashing")
+            embedding_idx = embedding_lookup(x, pi, D, T_l, N_l, BLOCK_D, False, T_POW_2, INT_DTYPE)
+            embedding_idx = (embedding_idx * F)[:, :, None] + tl.arange(0, BLOCK_F).to(tl.uint8)[None, None, :]
+        tl.static_assert(tl.constexpr(embedding_idx.dtype) == INT_DTYPE, f"Embedding index must be {INT_DTYPE}")
+
+        # Load embeddings
+        # NOTE: Since this is an uncoalesced load it helps to apply masking to the pointers as well as the load result.
+        # This keeps us from polluting the cache with values that will be discarded.
         emb_mask = (
             (tl.arange(0, BLOCK_N) < N)[:, None, None]
             & (tl.arange(0, 2**BLOCK_D) < 2**D)[None, :, None]
             & (tl.arange(0, BLOCK_F) < F)[None, None, :]
         )
-        embedding_idx = tl.where(emb_mask, embedding_idx, 0)
-        e = tl.load(e_p + embedding_idx, mask=emb_mask)
+        e = tl.load(e_p + embedding_idx, mask=emb_mask, eviction_policy="evict_last")
 
         # Interpolate embeddings
         e = interpolate(x, e, D, BLOCK_D)[:, None, :]
+        tl.static_assert(tl.constexpr(e.dtype) == tl.constexpr(e_p.dtype.element_ty), "Embedding dtype should match output")
 
         # Update output
-        mask = tl.arange(0, L) == l
+        mask = tl.arange(0, LOOP_SIZE) == l - START_L
         o = tl.where(mask[None, :, None], e, o)
 
         # Advance pointers
         e_p += T_l * stride_e_t
 
         # Synchronize workers at this level to ensure a high cache hit rate.
-        # This yields a very tangible speedup.
-        tl.debug_barrier()
+        if SYNCHRONIZE:
+            tl.debug_barrier()
 
-    o = tl.reshape(o, (BLOCK_N, L * BLOCK_F))
     start = tl.program_id(0) * BLOCK_N
+    o = tl.reshape(o, (BLOCK_N, LOOP_SIZE * BLOCK_F))
     O_block_ptr = tl.make_block_ptr(
         o_p,
         (N, L * F),
         (stride_o_n, stride_o_f),
-        (start, 0),
-        (BLOCK_N, L * BLOCK_F),
+        (start, F * START_L),
+        (BLOCK_N, LOOP_SIZE * BLOCK_F),
         (1, 0),
     )
     tl.store(O_block_ptr, o, boundary_check=(0, 1), eviction_policy="evict_first")
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_N": 64}, num_warps=4),
-        triton.Config({"BLOCK_N": 64}, num_warps=8),
-        triton.Config({"BLOCK_N": 128}, num_warps=4),
-        triton.Config({"BLOCK_N": 128}, num_warps=8),
-        triton.Config({"BLOCK_N": 256}, num_warps=4),
-        triton.Config({"BLOCK_N": 256}, num_warps=8),
-        triton.Config({"BLOCK_N": 256}, num_warps=16),
-    ],
-    key=["D", "F", "L", "T", "MIN_RES", "MAX_RES"],
-)
 @triton.heuristics(
     values={
-        # "BLOCK_N": PowerOfTwoHeuristic("N", max_val=64),
         "BLOCK_D": PowerOfTwoHeuristic("D"),
         "BLOCK_F": PowerOfTwoHeuristic("F"),
-        "B": _compute_b,
-        "FIRST_HASH_LEVEL": _get_first_hash_level,
+        "BLOCK_N": SMHeuristic("x_p", "N", max_size=512),
+        "num_warps": lambda args: 16 if args["BLOCK_N"] == 512 else 8 if args["BLOCK_N"] >= 128 else 4,
+        "HASH_LEVEL": lambda args: get_first_hash_level(args["MIN_RES"], args["MAX_RES"], args["L"], args["T"], args["D"]),
+        "B": lambda args: compute_b(args["MIN_RES"], args["MAX_RES"], args["L"]),
     }
 )
 @triton.jit
@@ -321,24 +311,29 @@ def _bwd_kernel(
     N: int, D: tl.constexpr, F: tl.constexpr,
     # Hash parameters
     T: tl.constexpr, L: tl.constexpr, MIN_RES: tl.constexpr, MAX_RES: tl.constexpr,
+    # Operating range and optimization
+    START_L: tl.constexpr, END_L: tl.constexpr,
     # Block sizes
     BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_F: tl.constexpr,
-    # Derived parameters
-    B: tl.constexpr, FIRST_HASH_LEVEL: tl.constexpr,
-    # Dtypes
-    INT_DTYPE: tl.constexpr = tl.uint32,
+    # Derived
+    HASH_LEVEL: tl.constexpr, B: tl.constexpr,
     # fmt: on
 ):
     # Input validation and constant setup
-    tl.static_assert(
-        FIRST_HASH_LEVEL > 0, "Hashing requested at first level, this indicates a bug or poor table parameters"
-    )
     T_POW_2: tl.constexpr = T & (T - 1) == 0
-
+    INT_DTYPE: tl.constexpr = tl.uint32
+    tl.static_assert(B > 1, f"B must be greater than 1, got B={B}")
+    tl.static_assert(START_L < L, f"START_L={START_L} must be less than L={L}")
+    tl.static_assert(START_L < END_L, f"START_L={START_L} must be less than END_L={END_L}")
+    LOOP_SIZE: tl.constexpr = END_L - START_L if END_L < L else L - START_L
+    ANY_HASH: tl.constexpr = HASH_LEVEL < START_L + LOOP_SIZE
+    tl.static_assert(START_L + LOOP_SIZE <= L, "Loop size exceeds L")
+    tl.static_assert(LOOP_SIZE & (LOOP_SIZE - 1) == 0, "Loop size must be a power of 2")
+    
     # Set pointers to this program's start
     start = tl.program_id(0) * BLOCK_N
 
-    # Load input
+    # Load input and apply initial scale
     X_block_ptr = tl.make_block_ptr(
         x_p,
         (N, D),
@@ -348,43 +343,54 @@ def _bwd_kernel(
         (1, 0),
     )
     x = tl.load(X_block_ptr, boundary_check=(0, 1))
+    tl.device_assert(x >= 0, "x must be non-negative")
+    tl.device_assert(x <= 1, "x must be less than 1")
+    INITIAL_SCALE: tl.constexpr = int(MIN_RES * B ** START_L)
+    x *= to_tensor(INITIAL_SCALE, x.dtype)
 
-    # Load pi
-    offsets = tl.arange(0, BLOCK_D)
-    mask = offsets < D
-    pi = tl.load(pi_p + offsets, mask=mask).to(INT_DTYPE)
-
+    # Load pi if it will be needed
+    if ANY_HASH:
+        offsets = tl.arange(0, BLOCK_D)
+        mask = offsets < D
+        pi = tl.load(pi_p + offsets, mask=mask, eviction_policy="evict_last").to(INT_DTYPE)
+    else:
+        pi = tl.arange(0, BLOCK_D).to(INT_DTYPE)
+    
     # Initialize DO pointer
     DO_block_ptr = tl.make_block_ptr(
         do_p,
         (N, F * L),
         (stride_do_n, stride_do_f),
-        (start, 0),
+        (start, F*START_L),
         (BLOCK_N, BLOCK_F),
         (1, 0),
     )
 
     # Iterate over hash table levels
-    N_l_prev = tl.constexpr(1)
-    for l in tl.static_range(L):
+    for l in tl.static_range(START_L, START_L + LOOP_SIZE):
         # Resolution and number of array entries for this level
-        N_l = tl.constexpr(MIN_RES * B**l)
-        T_l = tl.constexpr(min((MIN_RES * B**l + 1) ** D, T))
+        N_l = tl.constexpr(int(MIN_RES * B**l))
+        T_l = tl.constexpr(min((tl.constexpr(int(MIN_RES * B**l)) + 1) ** D, T))
+        N_l = N_l.to(tl.uint32)
+        T_l = T_l.to(tl.uint32)
 
-        # Apply scaling to x
-        X_SCALE = tl.constexpr(N_l // N_l_prev)
-        x = x * X_SCALE
-        N_l_prev = tl.constexpr(N_l)
+        # Scale x for this level
+        if l > START_L:
+            N_l_prev = tl.constexpr(int(MIN_RES * B**(l-1)))
+            scale = N_l.to(x.dtype) / N_l_prev.to(x.dtype)
+            x *= scale.to(x.dtype)
+        tl.static_assert(tl.constexpr(x.dtype) is tl.constexpr(x_p.dtype.element_ty), "x dtype should not change")
 
         # Look up embeddings
-        embedding_idx = embedding_lookup(x, pi, D, T_l, N_l, BLOCK_D, l >= FIRST_HASH_LEVEL, T_POW_2, INT_DTYPE)
-        embedding_idx = (embedding_idx * F)[:, :, None] + tl.arange(0, BLOCK_F).to(INT_DTYPE)[None, None, :]
-        mask = (
-            (tl.arange(0, BLOCK_N) < N)[:, None, None]
-            & (tl.arange(0, 2**BLOCK_D) < 2**D)[None, :, None]
-            & (tl.arange(0, BLOCK_F) < F)[None, None, :]
-        )
-        embedding_idx = tl.where(mask, embedding_idx, 0)
+        if l >= HASH_LEVEL:
+            tl.device_assert(T_l >= T, "T_l should be >= T when hashing")
+            embedding_idx = embedding_lookup(x, pi, D, T_l, N_l, BLOCK_D, True, T_POW_2, INT_DTYPE)
+            embedding_idx = (embedding_idx * F)[:, :, None] + tl.arange(0, BLOCK_F).to(tl.uint8)[None, None, :]
+        else:
+            tl.device_assert(T_l < T, "T_l should be < T when not hashing")
+            embedding_idx = embedding_lookup(x, pi, D, T_l, N_l, BLOCK_D, False, T_POW_2, INT_DTYPE)
+            embedding_idx = (embedding_idx * F)[:, :, None] + tl.arange(0, BLOCK_F).to(tl.uint8)[None, None, :]
+        tl.static_assert(tl.constexpr(embedding_idx.dtype) == INT_DTYPE, f"Embedding index must be {INT_DTYPE}")
 
         # Get interpolation weights (N, 2**D)
         w = get_interpolation_weights(x, D, BLOCK_D)[:, :, None]
@@ -393,15 +399,242 @@ def _bwd_kernel(
         do = tl.load(DO_block_ptr, boundary_check=(0, 1))
 
         # Compute de (N, 2**D, F)
-        de = do[:, None, :] * w
+        de = do[:, None, :] * w.to(do.dtype)
 
         # Store
+        mask = (
+            (tl.arange(0, BLOCK_N) < N)[:, None, None]
+            & (tl.arange(0, 2**BLOCK_D) < 2**D)[None, :, None]
+            & (tl.arange(0, BLOCK_F) < F)[None, None, :]
+        )
         tl.atomic_add(de_p + embedding_idx, de, mask=mask)
 
         # Advance pointers
-        if l < L - 1:
+        if l < START_L + LOOP_SIZE - 1:
             DO_block_ptr = tl.advance(DO_block_ptr, (0, BLOCK_F))
             de_p += T_l * stride_de_t
+
+
+@triton.heuristics(
+    values={
+        "BLOCK_D": PowerOfTwoHeuristic("D"),
+        "BLOCK_F": PowerOfTwoHeuristic("F"),
+        "BLOCK_N": SMHeuristic("x_p", "N", max_size=512),
+        "num_warps": lambda args: 16 if args["BLOCK_N"] == 512 else 8 if args["BLOCK_N"] >= 128 else 4,
+        "HASH_LEVEL": lambda args: get_first_hash_level(args["MIN_RES"], args["MAX_RES"], args["L"], args["T"], args["D"]),
+        "B": lambda args: compute_b(args["MIN_RES"], args["MAX_RES"], args["L"]),
+    }
+)
+@triton.jit
+def _bwd_kernel_preprocess(
+    # fmt: off
+    # Input
+    x_p, pi_p, idx_p, w_p,
+    # Strides
+    stride_x_n: int, stride_x_d: int,
+    stride_idx_n: int, stride_idx_l: int, stride_idx_d: int,
+    stride_w_n: int, stride_w_l: int, stride_w_d: int,
+    # Sizes
+    N: int, D: tl.constexpr, F: tl.constexpr,
+    # Hash parameters
+    T: tl.constexpr, L: tl.constexpr, MIN_RES: tl.constexpr, MAX_RES: tl.constexpr,
+    # Operating range and optimization
+    START_L: tl.constexpr, END_L: tl.constexpr,
+    # Block sizes
+    BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_F: tl.constexpr,
+    # Derived
+    HASH_LEVEL: tl.constexpr, B: tl.constexpr,
+    # fmt: on
+):
+    # Input validation and constant setup
+    T_POW_2: tl.constexpr = T & (T - 1) == 0
+    INT_DTYPE: tl.constexpr = tl.uint32
+    tl.static_assert(B > 1, f"B must be greater than 1, got B={B}")
+    tl.static_assert(START_L < L, f"START_L={START_L} must be less than L={L}")
+    tl.static_assert(START_L < END_L, f"START_L={START_L} must be less than END_L={END_L}")
+    LOOP_SIZE: tl.constexpr = END_L - START_L if END_L < L else L - START_L
+    ANY_HASH: tl.constexpr = HASH_LEVEL < START_L + LOOP_SIZE
+    tl.static_assert(START_L + LOOP_SIZE <= L, "Loop size exceeds L")
+    tl.static_assert(LOOP_SIZE & (LOOP_SIZE - 1) == 0, "Loop size must be a power of 2")
+    
+    # Set pointers to this program's start
+    start = tl.program_id(0) * BLOCK_N
+
+    # Load input and apply initial scale
+    X_block_ptr = tl.make_block_ptr(
+        x_p,
+        (N, D),
+        (stride_x_n, stride_x_d),
+        (start, 0),
+        (BLOCK_N, BLOCK_D),
+        (1, 0),
+    )
+    x = tl.load(X_block_ptr, boundary_check=(0, 1))
+    tl.device_assert(x >= 0, "x must be non-negative")
+    tl.device_assert(x <= 1, "x must be less than 1")
+    INITIAL_SCALE: tl.constexpr = int(MIN_RES * B ** START_L)
+    x *= to_tensor(INITIAL_SCALE, x.dtype)
+
+    # Load pi if it will be needed
+    if ANY_HASH:
+        offsets = tl.arange(0, BLOCK_D)
+        mask = offsets < D
+        pi = tl.load(pi_p + offsets, mask=mask, eviction_policy="evict_last").to(INT_DTYPE)
+    else:
+        pi = tl.arange(0, BLOCK_D).to(INT_DTYPE)
+    
+    # Initialize block pointers
+    IDX_block_ptr = tl.make_block_ptr(
+        idx_p,
+        (N, L, 2**D),
+        (stride_idx_n, stride_idx_l, stride_idx_d),
+        (start, START_L, 0),
+        (BLOCK_N, 1, 2**BLOCK_D),
+        (2, 1, 0),
+    )
+    W_block_ptr = tl.make_block_ptr(
+        w_p,
+        (N, L, 2**D),
+        (stride_w_n, stride_w_l, stride_w_d),
+        (start, START_L, 0),
+        (BLOCK_N, 1, 2**BLOCK_D),
+        (2, 1, 0),
+    )
+
+    # Iterate over hash table levels
+    for l in tl.static_range(START_L, START_L + LOOP_SIZE):
+        # Resolution and number of array entries for this level
+        N_l = tl.constexpr(int(MIN_RES * B**l))
+        T_l = tl.constexpr(min((tl.constexpr(int(MIN_RES * B**l)) + 1) ** D, T))
+        N_l = N_l.to(tl.uint32)
+        T_l = T_l.to(tl.uint32)
+
+        # Scale x for this level
+        if l > START_L:
+            N_l_prev = tl.constexpr(int(MIN_RES * B**(l-1)))
+            scale = N_l.to(x.dtype) / N_l_prev.to(x.dtype)
+            x *= scale.to(x.dtype)
+        tl.static_assert(tl.constexpr(x.dtype) is tl.constexpr(x_p.dtype.element_ty), "x dtype should not change")
+
+        # Look up and store embeddings
+        if l >= HASH_LEVEL:
+            tl.device_assert(T_l >= T, "T_l should be >= T when hashing")
+            embedding_idx = embedding_lookup(x, pi, D, T_l, N_l, BLOCK_D, True, T_POW_2, INT_DTYPE)
+        else:
+            tl.device_assert(T_l < T, "T_l should be < T when not hashing")
+            embedding_idx = embedding_lookup(x, pi, D, T_l, N_l, BLOCK_D, False, T_POW_2, INT_DTYPE)
+        embedding_idx = embedding_idx[:, None, :]
+        tl.static_assert(tl.constexpr(embedding_idx.dtype) == INT_DTYPE, f"Embedding index must be {INT_DTYPE}")
+        tl.store(IDX_block_ptr, embedding_idx.to(idx_p.dtype.element_ty, bitcast=True), boundary_check=(0, 1, 2))
+
+        # Get and store interpolation weights (N, 2**D)
+        w = get_interpolation_weights(x, D, BLOCK_D).to(w_p.dtype.element_ty)[:, None, :]
+        tl.store(W_block_ptr, w, boundary_check=(0, 1, 2))
+
+        # Advance pointers
+        if l < START_L + LOOP_SIZE - 1:
+            IDX_block_ptr = tl.advance(IDX_block_ptr, (0, 1, 0))
+            W_block_ptr = tl.advance(W_block_ptr, (0, 1, 0))
+
+
+@triton.heuristics(
+    values={
+        "BLOCK_D": PowerOfTwoHeuristic("D"),
+        "BLOCK_F": PowerOfTwoHeuristic("F"),
+        "BLOCK_N": SMHeuristic("do_p", "N", max_size=512),
+        "num_warps": lambda args: 16 if args["BLOCK_N"] == 512 else 8 if args["BLOCK_N"] >= 128 else 4,
+        "B": lambda args: compute_b(args["MIN_RES"], args["MAX_RES"], args["L"]),
+    }
+)
+@triton.jit
+def _bwd_kernel_postprocess(
+    # fmt: off
+    # Input
+    do_p, idx_p, w_p, de_p,
+    # Strides
+    stride_do_n: int, stride_do_f: int,
+    stride_idx_n: int, stride_idx_l: int, stride_idx_d: int,
+    stride_w_n: int, stride_w_l: int, stride_w_d: int,
+    stride_de_t: int,
+    # Sizes
+    N: int, D: tl.constexpr, F: tl.constexpr,
+    # Hash parameters
+    T: tl.constexpr, L: tl.constexpr, MIN_RES: tl.constexpr, MAX_RES: tl.constexpr,
+    # Operating range and optimization
+    START_L: tl.constexpr, END_L: tl.constexpr,
+    # Block sizes
+    BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_F: tl.constexpr,
+    # Derived
+    B: tl.constexpr,
+    # fmt: on
+):
+    # Input validation and constant setup
+    tl.static_assert(START_L < L, f"START_L={START_L} must be less than L={L}")
+    tl.static_assert(START_L < END_L, f"START_L={START_L} must be less than END_L={END_L}")
+    LOOP_SIZE: tl.constexpr = END_L - START_L if END_L < L else L - START_L
+    tl.static_assert(START_L + LOOP_SIZE <= L, "Loop size exceeds L")
+    tl.static_assert(LOOP_SIZE & (LOOP_SIZE - 1) == 0, "Loop size must be a power of 2")
+    
+    # Set pointers to this program's start
+    start = tl.program_id(0) * BLOCK_N
+    
+    # Initialize block pointers
+    DO_block_ptr = tl.make_block_ptr(
+        do_p,
+        (N, F * L),
+        (stride_do_n, stride_do_f),
+        (start, F*START_L),
+        (BLOCK_N, BLOCK_F),
+        (1, 0),
+    )
+    IDX_block_ptr = tl.make_block_ptr(
+        idx_p,
+        (N, L, 2**D),
+        (stride_idx_n, stride_idx_l, stride_idx_d),
+        (start, START_L, 0),
+        (BLOCK_N, 1, 2**BLOCK_D),
+        (2, 1, 0),
+    )
+    W_block_ptr = tl.make_block_ptr(
+        w_p,
+        (N, L, 2**D),
+        (stride_w_n, stride_w_l, stride_w_d),
+        (start, START_L, 0),
+        (BLOCK_N, 1, 2**BLOCK_D),
+        (2, 1, 0),
+    )
+
+    # Iterate over hash table levels
+    for l in tl.static_range(START_L, START_L + LOOP_SIZE):
+        T_l = tl.constexpr(min((tl.constexpr(int(MIN_RES * B**l)) + 1) ** D, T))
+
+        # Load weights
+        w = tl.load(W_block_ptr, boundary_check=(0, 1, 2))
+        w = tl.reshape(w, (BLOCK_N, 2**BLOCK_D, 1))
+
+        # Load do for this level (N, F)
+        do = tl.load(DO_block_ptr, boundary_check=(0, 1))
+
+        # Compute de (N, 2**D, F)
+        de = do[:, None, :] * w.to(do.dtype)
+
+        # Store
+        embedding_idx = tl.load(IDX_block_ptr, boundary_check=(0, 1, 2))
+        embedding_idx = tl.reshape(embedding_idx, (BLOCK_N, 2**BLOCK_D))
+        embedding_idx = (embedding_idx * F)[:, :, None] + tl.arange(0, BLOCK_F).to(tl.uint8)[None, None, :]
+        mask = (
+            (tl.arange(0, BLOCK_N) < N)[:, None, None]
+            & (tl.arange(0, 2**BLOCK_D) < 2**D)[None, :, None]
+            & (tl.arange(0, BLOCK_F) < F)[None, None, :]
+        )
+        tl.atomic_add(de_p + embedding_idx, de, mask=mask)
+
+        # Advance pointers
+        if l < START_L + LOOP_SIZE - 1:
+            de_p += T_l * stride_de_t
+            DO_block_ptr = tl.advance(DO_block_ptr, (0, BLOCK_F))
+            IDX_block_ptr = tl.advance(IDX_block_ptr, (0, 1, 0))
+            W_block_ptr = tl.advance(W_block_ptr, (0, 1, 0))
 
 
 def _cpu_create_corner_offsets(d: int, **kwargs) -> Tensor:
@@ -453,22 +686,15 @@ def _cpu_hash_encoding(
     assert 1 <= D <= 3, "D must be 1, 2, or 3"
     resolutions = compute_resolutions(L, N_min, N_max)
     t_vals = compute_embedding_counts(L, T, D, N_min, N_max)
-    x.shape[0]
     for l_i in range(L):
         n_i = resolutions[l_i]
         t_i = t_vals[l_i]
         emb_idx = _cpu_embedding_lookup(x, pi, D, t_i, n_i)
-        # assert (emb_idx >= 0).all()
-        # assert (emb_idx < t_i).all()
-        # foo = emb_idx.flatten().view(-1, 1) * F + torch.arange(F, device=emb_idx.device).view(1, -1)
-        # print(foo.flatten())
         e_i = seek_to_level_embeddings(e, l_i, L, T, D, N_min, N_max)
         e_i = e_i[emb_idx]
-        # print(e_i.flatten())
         start = l_i * F
         end = start + F
         e_i = _cpu_interpolate(x, e_i, D, n_i)
-        # print(e_i.flatten())
         o[..., start:end] = e_i
     return o
 
@@ -476,7 +702,6 @@ def _cpu_hash_encoding(
 class HashEncoding(torch.autograd.Function):
 
     @torch.cuda.amp.custom_fwd(cast_inputs=torch.float16)
-    @torch.no_grad()
     @staticmethod
     def forward(
         ctx,
@@ -496,8 +721,7 @@ class HashEncoding(torch.autograd.Function):
         L = math.prod(coords.shape[:-1])
 
         # Validate coords and ensure float32
-        assert coords.is_floating_point(), "Coords must be float32"
-        coords = coords.float()
+        assert coords.is_floating_point(), "Coords must be float"
 
         # Create pi if not provided
         if pi is None:
@@ -532,11 +756,12 @@ class HashEncoding(torch.autograd.Function):
         # Initialize output buffer
         D_out = D_embed * levels + D_feature
         out_shape = coords.shape[:-1] + (D_out,)
-        o = embeddings.new_empty(*out_shape)
+        o = embeddings.new_empty(*out_shape, requires_grad=embeddings.requires_grad)
 
         def grid(META):
             return (triton.cdiv(L, META["BLOCK_N"]),)
 
+        divider = levels // 2 if L >= 2**16 else levels
         _fwd_kernel[grid](  # type: ignore
             # fmt: off
             coords, pi, embeddings, o,
@@ -545,8 +770,21 @@ class HashEncoding(torch.autograd.Function):
             o.stride(-2), o.stride(-1),
             L, D_in, D_embed,
             max_entries_per_level, levels, min_res, max_res,
+            0, divider,
             # fmt: on
         )
+        if divider < levels:
+            _fwd_kernel[grid](  # type: ignore
+                # fmt: off
+                coords, pi, embeddings, o,
+                coords.stride(-2), coords.stride(-1),
+                embeddings.stride(-2),
+                o.stride(-2), o.stride(-1),
+                L, D_in, D_embed,
+                max_entries_per_level, levels, min_res, max_res,
+                divider, levels,
+                # fmt: on
+            )
 
         # Copy features to output if provided
         if features is not None:
@@ -570,11 +808,55 @@ class HashEncoding(torch.autograd.Function):
         D_embed = embeddings.shape[-1]
         L = math.prod(coords.shape[:-1])
 
+        idx = torch.empty((L, ctx.levels, 2**D_in), dtype=torch.int32, device=coords.device)
+        w = torch.empty((L, ctx.levels, 2**D_in), dtype=embeddings.dtype, device=embeddings.device)
         de = torch.zeros_like(embeddings)
 
         def grid(META):
             return (triton.cdiv(L, META["BLOCK_N"]),)
 
+        ## Run preprocessing
+        #divider = ctx.levels // 2 if L >= 2**16 else ctx.levels
+        #_bwd_kernel_preprocess[grid](  # type: ignore
+        #    # fmt: off
+        #    coords, pi, idx, w,
+        #    coords.stride(-2), coords.stride(-1),
+        #    idx.stride(0), idx.stride(1), idx.stride(2),
+        #    w.stride(0), w.stride(1), w.stride(2),
+        #    L, D_in, D_embed,
+        #    ctx.max_entries_per_level, ctx.levels, ctx.min_res, ctx.max_res,
+        #    0, divider,
+        #    # fmt: on
+        #)
+        #if divider < ctx.levels:
+        #    _bwd_kernel_preprocess[grid](  # type: ignore
+        #        # fmt: off
+        #        coords, pi, idx, w,
+        #        coords.stride(-2), coords.stride(-1),
+        #        idx.stride(0), idx.stride(1), idx.stride(2),
+        #        w.stride(0), w.stride(1), w.stride(2),
+        #        L, D_in, D_embed,
+        #        ctx.max_entries_per_level, ctx.levels, ctx.min_res, ctx.max_res,
+        #        divider, ctx.levels,
+        #        # fmt: on
+        #    )
+
+        # Run postprocessing
+        #_bwd_kernel_postprocess[grid](  # type: ignore
+        #    # fmt: off
+        #    do, idx, w, de,
+        #    do.stride(-2), do.stride(-1),
+        #    idx.stride(0), idx.stride(1), idx.stride(2),
+        #    w.stride(0), w.stride(1), w.stride(2),
+        #    de.stride(-2),
+        #    L, D_in, D_embed,
+        #    ctx.max_entries_per_level, ctx.levels, ctx.min_res, ctx.max_res,
+        #    0, ctx.levels,
+        #    # fmt: on
+        #)
+
+
+        divider = ctx.levels // 2 if L >= 2**16 else ctx.levels
         _bwd_kernel[grid](  # type: ignore
             # fmt: off
             coords, pi, do, de,
@@ -583,8 +865,21 @@ class HashEncoding(torch.autograd.Function):
             de.stride(-2),
             L, D_in, D_embed,
             ctx.max_entries_per_level, ctx.levels, ctx.min_res, ctx.max_res,
+            0, divider,
             # fmt: on
         )
+        if divider < ctx.levels:
+            _bwd_kernel[grid](  # type: ignore
+                # fmt: off
+                coords, pi, do, de,
+                coords.stride(-2), coords.stride(-1),
+                do.stride(-2), do.stride(-1),
+                de.stride(-2),
+                L, D_in, D_embed,
+                ctx.max_entries_per_level, ctx.levels, ctx.min_res, ctx.max_res,
+                divider, ctx.levels,
+                # fmt: on
+            )
 
         return None, de, None, None, None, None, None, None
 
@@ -609,3 +904,4 @@ def hash_encoding(
         max_res,
         levels,
     )
+

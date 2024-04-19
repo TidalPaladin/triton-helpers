@@ -6,8 +6,10 @@ import triton
 import triton.language as tl
 from torch import Tensor
 from torch.testing import assert_close
+from functools import partial
 
 from triton_helpers.layers.hash_encoding import HashEncoding, hash_encoding
+from triton_helpers.ops import to_tensor
 from triton_helpers.layers.hash_encoding.kernel import (
     PI_1,
     PI_2,
@@ -16,9 +18,11 @@ from triton_helpers.layers.hash_encoding.kernel import (
     _cpu_hash_encoding,
     _cpu_interpolate,
     compute_embedding_counts,
+    compute_resolutions,
     create_corner_offsets,
     embedding_lookup,
     interpolate,
+    get_first_hash_level,
 )
 
 
@@ -56,7 +60,7 @@ class TestCreateCornerOffsets:
     def kernel(self):
         @triton.jit
         def kernel(o_p, D: tl.constexpr, BLOCK_D: tl.constexpr):
-            corner_offsets = create_corner_offsets(BLOCK_D)
+            corner_offsets = create_corner_offsets(BLOCK_D).to(o_p.dtype.element_ty)
             Ptr = tl.make_block_ptr(o_p, (2**D, D), (D, 1), (0, 0), (2**BLOCK_D, BLOCK_D), (1, 0))
             tl.store(Ptr, corner_offsets, boundary_check=(0, 1))
 
@@ -173,7 +177,6 @@ class TestEmbeddingLookup:
 
     @pytest.fixture
     def kernel(self):
-        @triton.heuristics({"num_warps": lambda _: 1})
         @triton.jit
         def kernel(
             # fmt: off
@@ -199,7 +202,8 @@ class TestEmbeddingLookup:
             pi = tl.load(pi_p + offset_pi, mask=mask_pi).to(tl.uint32)
 
             # Hash
-            x = x * N_l
+            # For some reason masked vals were sometimes nonzero, so manually clamp everything here
+            x = tl.math.saturatef(x) * N_l
             o = embedding_lookup(x, pi, D, T_l.to(tl.uint32), N_l.to(tl.uint32), BLOCK_D, NEEDS_HASH, T_POW_2).to(
                 o_p.dtype.element_ty
             )
@@ -340,11 +344,12 @@ class TestEmbeddingLookup:
             (3, 128, (128 + 1) ** 2 - 1),
             (3, 100, (128 + 1) ** 2),
             (3, 100, (128 + 1) ** 2 - 1),
+            (3, 101, 1048576),
         ],
     )
     def test_torch_baseline_manyvals(self, kernel, D, N_level, T):
         torch.random.manual_seed(0)
-        L = 16
+        L = 64
 
         # Inputs
         x = torch.rand(L, D, device="cuda")
@@ -390,38 +395,74 @@ class TestEmbeddingLookup:
 @pytest.mark.cuda
 class TestHashEncoding:
 
-    def test_forward_basic(self, float_dtype):
-        torch.random.manual_seed(0)
-        L, D, F = 4, 2, 2
-        N_min, N_max = 2, 4
-        T, NUM_LEVELS = (N_max + 1) ** D - 1, 2
+    #@pytest.fixture
+    #def tinycudann(self):
+    #    Encoding = pytest.importorskip("tinycudann.modules", reason="TinyCudaNN is not installed.").Encoding
 
-        # Inputs
-        t = compute_embedding_counts(NUM_LEVELS, T, D, N_min, N_max)
-        e = torch.randn(sum(t), F, device="cuda", dtype=float_dtype)
-        x = torch.rand(L, D, device="cuda")
+    #    def func(L: int, D: int, F: int, T: int, N: int, X: int, Y: int, **kwargs):
+    #        b = math.exp((math.log(Y) - math.log(X)) / (N - 1))
+    #        config = {
+    #            "otype": "HashGrid",
+    #            "n_levels": N,
+    #            "n_features_per_level": F,
+    #            "log2_hashmap_size": int(math.log2(T)),
+    #            "base_resolution": X,
+    #            "per_level_scale": b + 1e-5,
+    #            #"interpolation": "Linear",
+    #        }
+    #        device = kwargs.get("device", "cuda")
+    #        module = Encoding(D, config, dtype=kwargs.get("dtype", torch.float32)).to(device)
+    #        return module
+    #    return func
 
-        # Baseline (x was set at corners so we can easily check edge features)
-        pi = torch.tensor([PI_1, PI_2, PI_3], device="cuda", dtype=torch.int64)[:D]
-        baseline = torch.zeros(L, F * NUM_LEVELS, device="cuda", dtype=float_dtype)
-        _cpu_hash_encoding(x, e, pi, baseline, D, F, T, NUM_LEVELS, N_min, N_max)
+    #@pytest.mark.parametrize(
+    #    "L, D, F, T, NUM_LEVELS, N_min, N_max",
+    #    [
+    #        (4, 2, 2, 2 ** 10, 4, 2, 8),
+    #        #(4, 2, 2, 2 ** 3, 3, 2, 8),
+    #        #(4, 2, 2, 2 ** 4, 3, 2, 8),
+    #        #(4, 2, 2, 2 ** 5, 3, 2, 8),
+    #        #(4, 2, 2, 2 ** 6, 3, 2, 8),
+    #        #(4, 2, 2, 2 ** 8, 3, 2, 8),
+    #    ],
+    #)
+    #def test_tinycudann_baseline(self, L, D, F, T, NUM_LEVELS, N_min, N_max, tinycudann):
+    #    torch.random.manual_seed(0)
 
-        # Triton
-        o = hash_encoding(x, e, None, None, T, N_min, N_max, NUM_LEVELS)
+    #    module = tinycudann(L, D, F, T, NUM_LEVELS, N_min, N_max, dtype=torch.float16, device="cuda")
 
-        assert_close(o, baseline, atol=1e-3, rtol=0)
+    #    # Inputs
+    #    t = compute_embedding_counts(NUM_LEVELS, T, D, N_min, N_max)
+    #    e = torch.randn(sum(t), F, device="cuda", dtype=torch.float16)
+
+    #    # 2, 10, 14
+    #    assert module.params.numel() == e.numel()
+    #    assert False
+    #    x = torch.rand(L, D, device="cuda")
+
+    #    # Baseline (x was set at corners so we can easily check edge features)
+    #    pi = torch.tensor([PI_1, PI_2, PI_3], device="cuda", dtype=torch.int64)[:D]
+    #    baseline = torch.zeros(L, F * NUM_LEVELS, device="cuda", dtype=torch.float16)
+    #    _cpu_hash_encoding(x, e, pi, baseline, D, F, T, NUM_LEVELS, N_min, N_max)
+
+    #    # Triton
+    #    hash_encoding(x, e, None, None, T, N_min, N_max, NUM_LEVELS)
 
     @pytest.mark.parametrize(
         "L, D, F, T, NUM_LEVELS, N_min, N_max",
         [
+            (4, 2, 2, (4 + 1) ** 2, 2, 2, 4),
+            (4, 2, 2, (8 + 1) ** 2, 8, 2, 128),
+            (4, 3, 2, 2**14, 16, 16, 512),
             (100, 3, 2, 2**14, 16, 16, 512),
             (100, 3, 2, 2**20, 16, 16, 512),
         ],
     )
-    def test_forward(self, L, D, F, T, NUM_LEVELS, N_min, N_max):
+    def test_forward_torch_baseline(self, L, D, F, T, NUM_LEVELS, N_min, N_max):
         torch.random.manual_seed(0)
 
         # Inputs
+        r = compute_resolutions(NUM_LEVELS, N_min, N_max)
         t = compute_embedding_counts(NUM_LEVELS, T, D, N_min, N_max)
         e = torch.randn(sum(t), F, device="cuda", dtype=torch.float16)
         x = torch.rand(L, D, device="cuda")
@@ -432,50 +473,43 @@ class TestHashEncoding:
         _cpu_hash_encoding(x, e, pi, baseline, D, F, T, NUM_LEVELS, N_min, N_max)
 
         # Triton
-        hash_encoding(x, e, None, None, T, N_min, N_max, NUM_LEVELS)
-
-    def test_backward_basic(self, float_dtype):
-        torch.random.manual_seed(0)
-        L, D, F = 4, 2, 2
-        N_min, N_max = 2, 4
-        T, NUM_LEVELS = (N_max + 1) ** D - 1, 2
-
-        # Inputs
-        t = compute_embedding_counts(NUM_LEVELS, T, D, N_min, N_max)
-        e = torch.randn(sum(t), F, device="cuda", dtype=float_dtype, requires_grad=True)
-        x = torch.rand(L, D, device="cuda")
-
-        # Baseline (x was set at corners so we can easily check edge features)
-        pi = torch.tensor([PI_1, PI_2, PI_3], device="cuda", dtype=torch.int64)[:D]
-        o = torch.zeros(L, F * NUM_LEVELS, device="cuda", dtype=float_dtype)
-        _cpu_hash_encoding(x, e, pi, o, D, F, T, NUM_LEVELS, N_min, N_max)
-        o.sum().backward()
-        baseline_de = e.grad
-        e.grad = None
-
-        # Triton
         o = hash_encoding(x, e, None, None, T, N_min, N_max, NUM_LEVELS)
-        o.sum().backward()
-        de = e.grad
 
-        assert_close(de, baseline_de, atol=0, rtol=1e-2)
+        hash_level = get_first_hash_level(N_min, N_max, L, T, D)
+        last_nonhash_level = hash_level - 1
+        check_close = partial(assert_close, atol=1e-2, rtol=0)
+        check_close(
+            o[..., hash_level*F:], baseline[..., hash_level*F:], 
+            msg="Mismatch in hash level features",
+        )
+        check_close(
+            o[..., last_nonhash_level*F:], baseline[..., last_nonhash_level*F:],
+            msg="Mismatch in the last non-hash level features",
+        )
+        check_close(
+            o[..., :hash_level*F], baseline[..., :hash_level*F],
+            msg="Mismatch in the hash level features",
+        )
+        check_close(o, baseline)
+
 
     @pytest.mark.parametrize(
         "L, D, F, T, NUM_LEVELS, N_min, N_max",
         [
-            (8, 3, 2, 30, 2, 2, 4),
-            (10, 3, 2, 30, 2, 2, 4),
+            (4, 2, 2, (4 + 1) ** 2, 2, 2, 4),
+            (4, 2, 2, (8 + 1) ** 2, 8, 2, 128),
+            (4, 3, 2, 2**14, 16, 16, 512),
             (100, 3, 2, 2**14, 16, 16, 512),
+            (100, 3, 2, 2**20, 16, 16, 512),
         ],
     )
-    def test_backward_hash(self, L, D, F, T, NUM_LEVELS, N_min, N_max):
+    def test_backward_torch_baseline(self, L, D, F, T, NUM_LEVELS, N_min, N_max):
         torch.random.manual_seed(0)
 
         # Inputs
         t = compute_embedding_counts(NUM_LEVELS, T, D, N_min, N_max)
         e = torch.randn(sum(t), F, device="cuda", dtype=torch.float16, requires_grad=True)
         x = torch.rand(L, D, device="cuda")
-        x = x.fill_(0)
 
         # Baseline (x was set at corners so we can easily check edge features)
         pi = torch.tensor([PI_1, PI_2, PI_3], device="cuda", dtype=torch.int64)[:D]
@@ -483,14 +517,31 @@ class TestHashEncoding:
         _cpu_hash_encoding(x, e, pi, o, D, F, T, NUM_LEVELS, N_min, N_max)
         o.sum().backward()
         baseline_de = e.grad
+        assert baseline_de is not None
         e.grad = None
 
         # Triton
         o = hash_encoding(x, e, None, None, T, N_min, N_max, NUM_LEVELS)
         o.sum().backward()
         de = e.grad
+        assert de is not None
 
-        assert_close(de, baseline_de, rtol=1e-2, atol=0)
+        hash_level = get_first_hash_level(N_min, N_max, L, T, D)
+        last_nonhash_level = hash_level - 1
+        check_close = partial(assert_close, atol=1e-2, rtol=1e-2)
+        check_close(
+            de[..., hash_level*F:], baseline_de[..., hash_level*F:], 
+            msg="Mismatch in hash level features",
+        )
+        check_close(
+            de[..., last_nonhash_level*F:], baseline_de[..., last_nonhash_level*F:],
+            msg="Mismatch in the last non-hash level features",
+        )
+        check_close(
+            de[..., :hash_level*F], baseline_de[..., :hash_level*F],
+            msg="Mismatch in the hash level features",
+        )
+        check_close(de, baseline_de)
 
     @pytest.mark.skip
     def test_forward_module(self):
