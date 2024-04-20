@@ -395,17 +395,19 @@ class TestEmbeddingLookup:
 class TestHashEncoding:
 
     @pytest.mark.parametrize(
-        "L, D, F, T, NUM_LEVELS, N_min, N_max",
+        "L, D, F, T, NUM_LEVELS, N_min, N_max, scale",
         [
-            (4, 2, 2, (4 + 1) ** 2, 2, 2, 4),
-            (4, 2, 2, (8 + 1) ** 2, 8, 2, 128),
-            (4, 3, 2, 2**14, 16, 16, 512),
-            (100, 3, 2, 2**14, 16, 16, 512),
-            (100, 3, 2, 2**20, 16, 16, 512),
-            (65536, 3, 2, 2**20, 16, 16, 512),
+            (4, 2, 2, (4 + 1) ** 2, 2, 2, 4, 1.0),
+            (4, 2, 2, (8 + 1) ** 2, 8, 2, 128, 1.0),
+            (4, 3, 2, 2**14, 16, 16, 512, 1.0),
+            (100, 3, 2, 2**14, 16, 16, 512, 1.0),
+            (100, 3, 2, 2**20, 16, 16, 512, 1.0),
+            (65536, 3, 2, 2**20, 16, 16, 512, 1.0),
+            (128 * 1024, 3, 2, 2**14, 16, 16, 512, 1.0),
+            (100, 3, 2, 2**14, 16, 16, 512, 2.0),
         ],
     )
-    def test_forward_torch_baseline(self, L, D, F, T, NUM_LEVELS, N_min, N_max):
+    def test_forward_torch_baseline(self, L, D, F, T, NUM_LEVELS, N_min, N_max, scale):
         torch.random.manual_seed(0)
 
         # Inputs
@@ -420,7 +422,8 @@ class TestHashEncoding:
         _cpu_hash_encoding(x, e, pi, baseline, D, F, T, NUM_LEVELS, N_min, N_max)
 
         # Triton
-        o = hash_encoding(x, e, None, None, T, N_min, N_max, NUM_LEVELS)
+        x.mul_(scale)
+        o = hash_encoding(x, e, None, None, T, N_min, N_max, NUM_LEVELS, scale=scale)
 
         hash_level = get_first_hash_level(N_min, N_max, L, T, D)
         last_nonhash_level = hash_level - 1
@@ -443,16 +446,19 @@ class TestHashEncoding:
         check_close(o, baseline)
 
     @pytest.mark.parametrize(
-        "L, D, F, T, NUM_LEVELS, N_min, N_max",
+        "L, D, F, T, NUM_LEVELS, N_min, N_max, scale",
         [
-            (4, 2, 2, (4 + 1) ** 2, 2, 2, 4),
-            (4, 2, 2, (8 + 1) ** 2, 8, 2, 128),
-            (4, 3, 2, 2**14, 16, 16, 512),
-            (100, 3, 2, 2**14, 16, 16, 512),
-            (100, 3, 2, 2**20, 16, 16, 512),
+            # (4, 2, 2, (4 + 1) ** 2, 2, 2, 4, 1.0),
+            # (4, 2, 2, (8 + 1) ** 2, 8, 2, 128, 1.0),
+            # (4, 3, 2, 2**14, 16, 16, 512, 1.0),
+            # (100, 3, 2, 2**14, 16, 16, 512, 1.0),
+            # (100, 3, 2, 2**20, 16, 16, 512, 1.0),
+            (65536, 3, 2, 2**20, 16, 16, 512, 1.0),
+            (128 * 1024, 3, 2, 2**14, 16, 16, 512, 1.0),
+            (100, 3, 2, 2**14, 16, 16, 512, 2.0),
         ],
     )
-    def test_backward_torch_baseline(self, L, D, F, T, NUM_LEVELS, N_min, N_max):
+    def test_backward_torch_baseline(self, L, D, F, T, NUM_LEVELS, N_min, N_max, scale):
         torch.random.manual_seed(0)
 
         # Inputs
@@ -463,21 +469,22 @@ class TestHashEncoding:
         # Baseline (x was set at corners so we can easily check edge features)
         pi = torch.tensor([PI_1, PI_2, PI_3], device="cuda", dtype=torch.int64)[:D]
         o = torch.zeros(L, F * NUM_LEVELS, device="cuda", dtype=torch.float16)
-        _cpu_hash_encoding(x, e, pi, o, D, F, T, NUM_LEVELS, N_min, N_max)
+        _cpu_hash_encoding(x.float(), e, pi, o, D, F, T, NUM_LEVELS, N_min, N_max)
         o.sum().backward()
         baseline_de = e.grad
         assert baseline_de is not None
         e.grad = None
 
         # Triton
-        o = hash_encoding(x, e, None, None, T, N_min, N_max, NUM_LEVELS)
+        x.mul_(scale)
+        o = hash_encoding(x, e, None, None, T, N_min, N_max, NUM_LEVELS, scale=scale)
         o.sum().backward()
         de = e.grad
         assert de is not None
 
         hash_level = get_first_hash_level(N_min, N_max, L, T, D)
         last_nonhash_level = hash_level - 1
-        check_close = partial(assert_close, atol=1e-2, rtol=1e-2)
+        check_close = partial(assert_close, atol=1e-3 * L, rtol=1e-2)
         check_close(
             de[..., hash_level * F :],
             baseline_de[..., hash_level * F :],
@@ -495,12 +502,11 @@ class TestHashEncoding:
         )
         check_close(de, baseline_de)
 
-    @pytest.mark.skip
     def test_forward_module(self):
         # Shapes
         B, L, D, F = 16, 40, 3, 2
 
-        layer = HashEncoding(2**4, 4, F, 16, 512).cuda()
+        layer = HashEncoding(2**14, 16, D, F, 16, 512).cuda()
         x = torch.rand(B, L, D, device="cuda")
 
         with torch.autocast(device_type="cuda", dtype=torch.float16):
@@ -508,12 +514,11 @@ class TestHashEncoding:
         assert isinstance(o, Tensor)
         assert o.dtype == torch.float16
 
-    @pytest.mark.skip
     def test_backward_module(self):
         # Shapes
         B, L, D, F = 16, 40, 3, 2
 
-        layer = HashEncoding(2**8, 4, F, 16, 512).cuda()
+        layer = HashEncoding(2**8, 4, D, F, 16, 512).cuda()
         x = torch.rand(B, L, D, device="cuda", requires_grad=True)
 
         with torch.autocast(device_type="cuda", dtype=torch.float16):
@@ -521,3 +526,37 @@ class TestHashEncoding:
 
         o.sum().backward()
         assert layer.embeddings.grad is not None
+
+    @pytest.mark.skip(reason="Benchmark")
+    def test_module_dtype_precision_benchmark(self):
+        # Shapes
+        B, L, D, F = 32, 128, 3, 2
+
+        layer = HashEncoding(2**14, 16, D, F, 16, 512).cuda()
+        pi = layer.pi
+        e = layer.embeddings.detach()
+        x = torch.rand(B, L, D, device="cuda")
+        x_16 = x.to(torch.float16)
+        e_16 = e.to(torch.float16)
+
+        func = partial(hash_encoding, pi=pi, max_entries_per_level=2**14, min_res=16, max_res=512, levels=16)
+
+        # Baseline result all in FP32
+        baseline = func(x, e)
+        baseline_ms = triton.testing.do_bench(lambda: func(x, e))
+
+        # Result in all FP16
+        fp16 = func(x_16, e_16)
+        fp16_ms = triton.testing.do_bench(lambda: func(x_16, e_16))
+        torch.abs(fp16 - baseline).mean().item()
+
+        # Result with coords FP16
+        xfp16 = func(x_16, e)
+        xfp16_ms = triton.testing.do_bench(lambda: func(x_16, e))
+        torch.abs(xfp16 - baseline).mean().item()
+
+        # Result in FP16 autocast
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            fp16_autocast = func(x, e)
+            fp16_autocast_ms = triton.testing.do_bench(lambda: func(x, e))
+        torch.abs(fp16_autocast - baseline).mean().item()

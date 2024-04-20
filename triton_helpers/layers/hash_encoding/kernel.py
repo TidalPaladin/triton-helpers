@@ -79,7 +79,9 @@ def interpolate(x: tl.tensor, e: tl.tensor, D: tl.constexpr, BLOCK_D: tl.constex
         (N, F)
     """
     w = get_interpolation_weights(x, D, BLOCK_D)[:, :, None]
-    return tl.sum(w.to(e.dtype) * e, axis=1).to(e.dtype)
+    # This is marginally faster to cast w to e.dtype before multiply/sum, but
+    # it's not worth the loss of precision.
+    return tl.sum(w * e, axis=1).to(e.dtype)
 
 
 @triton.jit
@@ -188,6 +190,7 @@ def _fwd_kernel(
     BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_F: tl.constexpr,
     # Derived
     HASH_LEVEL: tl.constexpr, B: tl.constexpr, E_START: tl.constexpr,
+    SCALE: tl.constexpr = 1.0,
     # fmt: on
 ):
     # Input validation and constant setup
@@ -216,11 +219,14 @@ def _fwd_kernel(
         (BLOCK_N, BLOCK_D),
         (1, 0),
     )
-    x = tl.load(X_block_ptr, boundary_check=(0, 1))
+    # NOTE: Representation quality is higher with FP32 coordinates, expecially at high
+    # resolution. Computation is faster with FP32, probably due to casting required for
+    # various constituent operations.
+    x = tl.load(X_block_ptr, boundary_check=(0, 1)).to(tl.float32)
     tl.device_assert(x >= 0, "x must be non-negative")
-    tl.device_assert(x <= 1, "x must be less than 1")
-    INITIAL_SCALE: tl.constexpr = int(MIN_RES * B**START_L)
-    x *= to_tensor(INITIAL_SCALE, x.dtype)
+    tl.device_assert(x <= SCALE, f"x must be less than SCALE={SCALE}")
+    INITIAL_SCALE: tl.constexpr = tl.constexpr(int(MIN_RES * B**START_L)) / SCALE
+    x *= INITIAL_SCALE
 
     # Load pi if it will be needed
     if ANY_HASH:
@@ -247,7 +253,6 @@ def _fwd_kernel(
             N_l_prev = tl.constexpr(int(MIN_RES * B ** (l - 1)))
             scale = N_l.to(x.dtype) / N_l_prev.to(x.dtype)
             x *= scale.to(x.dtype)
-        tl.static_assert(tl.constexpr(x.dtype) is tl.constexpr(x_p.dtype.element_ty), "x dtype should not change")
 
         # Look up embeddings
         if l >= HASH_LEVEL:
@@ -333,6 +338,7 @@ def _bwd_kernel(
     # Derived
     HASH_LEVEL: tl.constexpr, B: tl.constexpr,
     SYNCHRONIZE: tl.constexpr,
+    SCALE: tl.constexpr = 1.0,
     # fmt: on
 ):
     # Input validation and constant setup
@@ -358,10 +364,10 @@ def _bwd_kernel(
         (BLOCK_N, BLOCK_D),
         (1, 0),
     )
-    x = tl.load(X_block_ptr, boundary_check=(0, 1))
+    x = tl.load(X_block_ptr, boundary_check=(0, 1)).to(tl.float32)
     tl.device_assert(x >= 0, "x must be non-negative")
-    tl.device_assert(x <= 1, "x must be less than 1")
-    INITIAL_SCALE: tl.constexpr = int(MIN_RES * B**START_L)
+    tl.device_assert(x <= SCALE, f"x must be less than SCALE={SCALE}")
+    INITIAL_SCALE: tl.constexpr = tl.constexpr(int(MIN_RES * B**START_L)) / SCALE
     x *= to_tensor(INITIAL_SCALE, x.dtype)
 
     # Load pi if it will be needed
@@ -395,7 +401,6 @@ def _bwd_kernel(
             N_l_prev = tl.constexpr(int(MIN_RES * B ** (l - 1)))
             scale = N_l.to(x.dtype) / N_l_prev.to(x.dtype)
             x *= scale.to(x.dtype)
-        tl.static_assert(tl.constexpr(x.dtype) is tl.constexpr(x_p.dtype.element_ty), "x dtype should not change")
 
         # Look up embeddings
         if l >= HASH_LEVEL:
@@ -516,6 +521,7 @@ class HashEncoding(torch.autograd.Function):
         levels: int,
         divider: int | None = None,
         bwd_divider: int | None = None,
+        scale: float = 1.0,
     ) -> Tensor:
         # Establish dimensions
         D_in = coords.shape[-1]
@@ -578,6 +584,7 @@ class HashEncoding(torch.autograd.Function):
                     L, D_in, D_embed,
                     max_entries_per_level, levels, min_res, max_res,
                     i*divider, (i+1)*divider,
+                    SCALE=scale,
                     # fmt: on
                 )
 
@@ -590,7 +597,7 @@ class HashEncoding(torch.autograd.Function):
         # It seems like the only way to reliably choose a good divider is with autotuning.
         # Here we choose a divider if one is not already provided
         if divider is None:
-            key = (L, D_in, D_embed, max_entries_per_level, levels, min_res)
+            key = (L, D_in, D_embed, max_entries_per_level, levels, min_res, coords.dtype, embeddings.dtype)
             if key in DIVIDER_CONFIGS:
                 divider = DIVIDER_CONFIGS[key]
             else:
@@ -611,6 +618,7 @@ class HashEncoding(torch.autograd.Function):
         ctx.min_res = min_res
         ctx.max_res = max_res
         ctx.levels = levels
+        ctx.scale = scale
 
         return o
 
@@ -642,12 +650,13 @@ class HashEncoding(torch.autograd.Function):
                     L, D_in, D_embed,
                     ctx.max_entries_per_level, ctx.levels, ctx.min_res, ctx.max_res,
                     i*divider, (i+1)*divider,
+                    SCALE=ctx.scale,
                     # fmt: on
                 )
 
         divider = ctx.bwd_divider
         if divider is None:
-            key = (L, D_in, D_embed, ctx.max_entries_per_level, ctx.levels, ctx.min_res)
+            key = (L, D_in, D_embed, ctx.max_entries_per_level, ctx.levels, ctx.min_res, coords.dtype, embeddings.dtype)
             if key in BWD_DIVIDER_CONFIGS:
                 divider = BWD_DIVIDER_CONFIGS[key]
             else:
@@ -658,7 +667,7 @@ class HashEncoding(torch.autograd.Function):
 
         _launch(divider)
 
-        return None, de, None, None, None, None, None, None, None, None
+        return None, de, None, None, None, None, None, None, None, None, None
 
     @staticmethod
     def _possible_dividers(levels: int) -> Tuple[int, ...]:
@@ -676,11 +685,12 @@ def hash_encoding(
     levels: int = 16,
     divider: int | None = None,
     bwd_divider: int | None = None,
+    scale: float = 1.0,
 ) -> Tensor:
     r"""Implements a multi-resolution hash encoding as defined in Instant NGP.
 
     Args:
-        coord: Coodinate inputs on the range :math:`[0, 1]`.
+        coord: Coodinate inputs on the range :math:`[0, scale]`.
         embeddings: Embedding table.
         features: Optional features to concatenate to the output.
         pi: Hashing primes. Will be computed for up to ``D=3`` if not provided.
@@ -690,7 +700,7 @@ def hash_encoding(
         levels: Number of hash table levels.
         divider: Number of levels to process in a single pass. If not provided, will be autotuned.
         bwd_divider: Number of levels to process in a single pass during backward pass. If not provided, will be autotuned.
-
+        scale: Scale factor for the input coordinates.
 
     Shapes:
         ``coord`` - :math:`(..., D)` where :math:`D` is the number of spatial dimensions.
@@ -713,4 +723,5 @@ def hash_encoding(
         levels,
         divider,
         bwd_divider,
+        scale,
     )
