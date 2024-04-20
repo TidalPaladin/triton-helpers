@@ -99,6 +99,7 @@ class DivisorHeuristic:
     def __call__(self, args: Dict[str, Any]) -> int:
         dim = args[self.dim]
         largest_divisor_pow_2 = self.min_val
+        assert dim > 0
         while dim % (largest_divisor_pow_2 * 2) == 0:
             largest_divisor_pow_2 *= 2
 
@@ -153,6 +154,7 @@ class SMHeuristic:
     size_dims: str | Sequence[str]
     min_size: int = 1
     max_size: int = sys.maxsize
+    occupancy_threshold: float = 2.0
 
     def __call__(self, args: Dict[str, Any]) -> int:
         # Get the SM count and the total size of what we're parallelizing over
@@ -160,14 +162,25 @@ class SMHeuristic:
         total_size = self.get_total_size(args, self.size_dims)
 
         # There should be at least `sm_count` blocks to fully utilize the device
-        needed_block_size = triton.next_power_of_2(total_size // sm_count + 1) // 2
-        heuristic = DivisorHeuristic(
-            "dim",
-            self.min_size,
-            min(self.max_size, needed_block_size),
-        )
-        result = heuristic({"dim": needed_block_size})
-        return min(max(result, self.min_size), self.max_size)
+        needed_block_size = triton.cdiv(total_size, sm_count)
+
+        # If the needed block size is a power of two, return it
+        if needed_block_size & (needed_block_size - 1) == 0:
+            return min(max(needed_block_size, self.min_size), self.max_size)
+        assert needed_block_size > 1
+
+        # Otherwise we choose between next and previous power of two
+        next_pow_2 = triton.next_power_of_2(needed_block_size)
+        prev_pow_2 = next_pow_2 // 2
+
+        # Compute occupancy for both next and previous power of two
+        sm_occupancy_high = ((next_pow_2 * sm_count) % total_size) / next_pow_2
+        sm_occupancy_low = (total_size % (prev_pow_2 * sm_count)) / prev_pow_2
+
+        # Choose the previous power of two if it has better occupancy by a threshold
+        selection = prev_pow_2 if sm_occupancy_low > self.occupancy_threshold * sm_occupancy_high else next_pow_2
+
+        return min(max(selection, self.min_size), self.max_size)
 
     @classmethod
     def get_device(cls, args: Dict[str, Any], key: str) -> torch.device:

@@ -86,8 +86,8 @@ def test_select_heuristic(func, when_true, when_false, exp):
     "sm_count, size, min_size, max_size, exp",
     [
         (50, 100, 1, sys.maxsize, 2),
-        (80, 100, 1, sys.maxsize, 1),
-        (80, 100, 2, sys.maxsize, 2),
+        (80, 100, 1, sys.maxsize, 2),
+        (80, 100, 4, sys.maxsize, 4),
         (10, 100, 1, 4, 4),
     ],
 )

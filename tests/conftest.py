@@ -38,3 +38,15 @@ def triton_cache(tmp_path):
     path = tmp_path / ".triton"
     os.environ["TRITON_CACHE_DIR"] = str(path)
     return path
+
+
+@pytest.fixture(autouse=True, scope="session")
+def triton_debug():
+    os.environ["TRITON_DEBUG"] = str(1)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def no_autotune():
+    from triton.runtime import Autotuner
+
+    Autotuner.prune_configs = lambda self, *args, **kwargs: [self.configs[0]]
