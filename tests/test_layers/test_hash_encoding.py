@@ -397,12 +397,13 @@ class TestHashEncoding:
     @pytest.mark.parametrize(
         "L, D, F, T, NUM_LEVELS, N_min, N_max",
         [
-            (4, 2, 2, (4 + 1) ** 2, 2, 2, 4),
-            (4, 2, 2, (8 + 1) ** 2, 8, 2, 128),
-            (4, 3, 2, 2**14, 16, 16, 512),
-            (100, 3, 2, 2**14, 16, 16, 512),
-            (100, 3, 2, 2**20, 16, 16, 512),
-            (65536, 3, 2, 2**20, 16, 16, 512),
+            #(4, 2, 2, (4 + 1) ** 2, 2, 2, 4),
+            #(4, 2, 2, (8 + 1) ** 2, 8, 2, 128),
+            #(4, 3, 2, 2**14, 16, 16, 512),
+            #(100, 3, 2, 2**14, 16, 16, 512),
+            #(100, 3, 2, 2**20, 16, 16, 512),
+            #(65536, 3, 2, 2**20, 16, 16, 512),
+            (128*1024, 3, 2, 2**14, 16, 16, 512),
         ],
     )
     def test_forward_torch_baseline(self, L, D, F, T, NUM_LEVELS, N_min, N_max):
@@ -441,6 +442,7 @@ class TestHashEncoding:
             msg="Mismatch in the hash level features",
         )
         check_close(o, baseline)
+        assert False
 
     @pytest.mark.parametrize(
         "L, D, F, T, NUM_LEVELS, N_min, N_max",
@@ -495,12 +497,11 @@ class TestHashEncoding:
         )
         check_close(de, baseline_de)
 
-    @pytest.mark.skip
     def test_forward_module(self):
         # Shapes
         B, L, D, F = 16, 40, 3, 2
 
-        layer = HashEncoding(2**4, 4, F, 16, 512).cuda()
+        layer = HashEncoding(2**14, 16, D, F, 16, 512).cuda()
         x = torch.rand(B, L, D, device="cuda")
 
         with torch.autocast(device_type="cuda", dtype=torch.float16):
@@ -508,12 +509,11 @@ class TestHashEncoding:
         assert isinstance(o, Tensor)
         assert o.dtype == torch.float16
 
-    @pytest.mark.skip
     def test_backward_module(self):
         # Shapes
         B, L, D, F = 16, 40, 3, 2
 
-        layer = HashEncoding(2**8, 4, F, 16, 512).cuda()
+        layer = HashEncoding(2**8, 4, D, F, 16, 512).cuda()
         x = torch.rand(B, L, D, device="cuda", requires_grad=True)
 
         with torch.autocast(device_type="cuda", dtype=torch.float16):

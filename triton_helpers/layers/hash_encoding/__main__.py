@@ -54,7 +54,7 @@ class Triton(KernelExecutor):
     ) -> Dict[str, Tensor | None]:
         torch.random.manual_seed(0)
         x = self.rand((32, L, D), **kwargs)
-        layer = HashEncoding(T, N, F, X, Y).to(x.device)
+        layer = HashEncoding(T, N, D, F, X, Y)
         dtype = kwargs.get("dtype", torch.float32)
         e = layer.embeddings.to(dtype)
         e.requires_grad = kwargs.get("requires_grad", False)
