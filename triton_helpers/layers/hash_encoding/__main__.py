@@ -12,7 +12,7 @@ from .module import HashEncoding
 
 
 try:
-    from tinycudann.modules import Encoding
+    from tinycudann.modules import Encoding  # type: ignore
 except ImportError:
     Encoding = None
 
