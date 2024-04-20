@@ -1,5 +1,5 @@
 import math
-import sys
+from functools import partial
 from typing import Any, Dict, Final, Tuple
 
 import torch
@@ -7,16 +7,16 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from triton_helpers.heuristics import PowerOfTwoHeuristic, SMHeuristic
+from triton_helpers.heuristics import PowerOfTwoHeuristic, SelectHeuristic, SMHeuristic
 from triton_helpers.ops import high_low_mod, to_tensor
 
 from .helpers import (
     compute_b,
     compute_embedding_counts,
+    compute_level_embedding_offset,
     compute_resolutions,
     get_first_hash_level,
     seek_to_level_embeddings,
-    compute_level_embedding_offset,
 )
 
 
@@ -24,6 +24,8 @@ from .helpers import (
 PI_1: Final = 1
 PI_2: Final = 2_654_435_761
 PI_3: Final = 805_459_861
+
+RTX_3090_CACHE_SIZE_MB: Final = 6.144_000
 
 
 @triton.jit
@@ -112,8 +114,8 @@ def embedding_lookup(
     tl.device_assert((T_l < 2**32), "T_l must be less than 2**32")
     tl.device_assert((N_l < 2**32), "N_l must be less than 2**32")
     tl.device_assert(
-        (tl.math.pow((N_l + 1.0).to(tl.float64), D) > T_l) == NEEDS_HASH, 
-        f"Hashing condition set incorrectly, hash={NEEDS_HASH}"
+        (tl.math.pow((N_l + 1.0).to(tl.float64), D) > T_l) == NEEDS_HASH,
+        f"Hashing condition set incorrectly, hash={NEEDS_HASH}",
     )
 
     # Round x down by casting to uint type
@@ -151,11 +153,19 @@ def embedding_lookup(
     values={
         "BLOCK_D": PowerOfTwoHeuristic("D"),
         "BLOCK_F": PowerOfTwoHeuristic("F"),
-        "BLOCK_N": SMHeuristic("x_p", "N", max_size=512),
+        "BLOCK_N": SelectHeuristic(
+            lambda args: (args["END_L"] - args["START_L"]) < 16,
+            SMHeuristic("x_p", "N", max_size=512),
+            SMHeuristic("x_p", "N", max_size=256),
+        ),
         "num_warps": lambda args: 16 if args["BLOCK_N"] == 512 else 8 if args["BLOCK_N"] >= 128 else 4,
-        "HASH_LEVEL": lambda args: get_first_hash_level(args["MIN_RES"], args["MAX_RES"], args["L"], args["T"], args["D"]),
+        "HASH_LEVEL": lambda args: get_first_hash_level(
+            args["MIN_RES"], args["MAX_RES"], args["L"], args["T"], args["D"]
+        ),
         "B": lambda args: compute_b(args["MIN_RES"], args["MAX_RES"], args["L"]),
-        "E_START": lambda args: compute_level_embedding_offset(args.get("START_L", 0), args["L"], args["T"], args["D"], args["MIN_RES"], args["MAX_RES"]),
+        "E_START": lambda args: compute_level_embedding_offset(
+            args.get("START_L", 0), args["L"], args["T"], args["D"], args["MIN_RES"], args["MAX_RES"]
+        ),
         "SYNCHRONIZE": lambda _: True,
     }
 )
@@ -209,7 +219,7 @@ def _fwd_kernel(
     x = tl.load(X_block_ptr, boundary_check=(0, 1))
     tl.device_assert(x >= 0, "x must be non-negative")
     tl.device_assert(x <= 1, "x must be less than 1")
-    INITIAL_SCALE: tl.constexpr = int(MIN_RES * B ** START_L)
+    INITIAL_SCALE: tl.constexpr = int(MIN_RES * B**START_L)
     x *= to_tensor(INITIAL_SCALE, x.dtype)
 
     # Load pi if it will be needed
@@ -234,7 +244,7 @@ def _fwd_kernel(
 
         # Scale x for this level
         if l > START_L:
-            N_l_prev = tl.constexpr(int(MIN_RES * B**(l-1)))
+            N_l_prev = tl.constexpr(int(MIN_RES * B ** (l - 1)))
             scale = N_l.to(x.dtype) / N_l_prev.to(x.dtype)
             x *= scale.to(x.dtype)
         tl.static_assert(tl.constexpr(x.dtype) is tl.constexpr(x_p.dtype.element_ty), "x dtype should not change")
@@ -262,7 +272,9 @@ def _fwd_kernel(
 
         # Interpolate embeddings
         e = interpolate(x, e, D, BLOCK_D)[:, None, :]
-        tl.static_assert(tl.constexpr(e.dtype) == tl.constexpr(e_p.dtype.element_ty), "Embedding dtype should match output")
+        tl.static_assert(
+            tl.constexpr(e.dtype) == tl.constexpr(e_p.dtype.element_ty), "Embedding dtype should match output"
+        )
 
         # Update output
         mask = tl.arange(0, LOOP_SIZE) == l - START_L
@@ -292,10 +304,13 @@ def _fwd_kernel(
     values={
         "BLOCK_D": PowerOfTwoHeuristic("D"),
         "BLOCK_F": PowerOfTwoHeuristic("F"),
-        "BLOCK_N": SMHeuristic("x_p", "N", max_size=256),
+        "BLOCK_N": SMHeuristic("x_p", "N", max_size=512),
         "num_warps": lambda args: 16 if args["BLOCK_N"] == 512 else 8 if args["BLOCK_N"] >= 128 else 4,
-        "HASH_LEVEL": lambda args: get_first_hash_level(args["MIN_RES"], args["MAX_RES"], args["L"], args["T"], args["D"]),
+        "HASH_LEVEL": lambda args: get_first_hash_level(
+            args["MIN_RES"], args["MAX_RES"], args["L"], args["T"], args["D"]
+        ),
         "B": lambda args: compute_b(args["MIN_RES"], args["MAX_RES"], args["L"]),
+        "SYNCHRONIZE": lambda _: False,
     }
 )
 @triton.jit
@@ -317,6 +332,7 @@ def _bwd_kernel(
     BLOCK_N: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_F: tl.constexpr,
     # Derived
     HASH_LEVEL: tl.constexpr, B: tl.constexpr,
+    SYNCHRONIZE: tl.constexpr,
     # fmt: on
 ):
     # Input validation and constant setup
@@ -329,7 +345,7 @@ def _bwd_kernel(
     ANY_HASH: tl.constexpr = HASH_LEVEL < START_L + LOOP_SIZE
     tl.static_assert(START_L + LOOP_SIZE <= L, "Loop size exceeds L")
     tl.static_assert(LOOP_SIZE & (LOOP_SIZE - 1) == 0, "Loop size must be a power of 2")
-    
+
     # Set pointers to this program's start
     start = tl.program_id(0) * BLOCK_N
 
@@ -345,7 +361,7 @@ def _bwd_kernel(
     x = tl.load(X_block_ptr, boundary_check=(0, 1))
     tl.device_assert(x >= 0, "x must be non-negative")
     tl.device_assert(x <= 1, "x must be less than 1")
-    INITIAL_SCALE: tl.constexpr = int(MIN_RES * B ** START_L)
+    INITIAL_SCALE: tl.constexpr = int(MIN_RES * B**START_L)
     x *= to_tensor(INITIAL_SCALE, x.dtype)
 
     # Load pi if it will be needed
@@ -355,13 +371,13 @@ def _bwd_kernel(
         pi = tl.load(pi_p + offsets, mask=mask, eviction_policy="evict_last").to(INT_DTYPE)
     else:
         pi = tl.arange(0, BLOCK_D).to(INT_DTYPE)
-    
+
     # Initialize DO pointer
     DO_block_ptr = tl.make_block_ptr(
         do_p,
         (N, F * L),
         (stride_do_n, stride_do_f),
-        (start, F*START_L),
+        (start, F * START_L),
         (BLOCK_N, BLOCK_F),
         (1, 0),
     )
@@ -376,7 +392,7 @@ def _bwd_kernel(
 
         # Scale x for this level
         if l > START_L:
-            N_l_prev = tl.constexpr(int(MIN_RES * B**(l-1)))
+            N_l_prev = tl.constexpr(int(MIN_RES * B ** (l - 1)))
             scale = N_l.to(x.dtype) / N_l_prev.to(x.dtype)
             x *= scale.to(x.dtype)
         tl.static_assert(tl.constexpr(x.dtype) is tl.constexpr(x_p.dtype.element_ty), "x dtype should not change")
@@ -413,6 +429,9 @@ def _bwd_kernel(
         if l < START_L + LOOP_SIZE - 1:
             DO_block_ptr = tl.advance(DO_block_ptr, (0, BLOCK_F))
             de_p += T_l * stride_de_t
+
+        if SYNCHRONIZE:
+            tl.debug_barrier()
 
 
 def _cpu_create_corner_offsets(d: int, **kwargs) -> Tensor:
@@ -477,6 +496,10 @@ def _cpu_hash_encoding(
     return o
 
 
+DIVIDER_CONFIGS: Dict[Any, int] = {}
+BWD_DIVIDER_CONFIGS: Dict[Any, int] = {}
+
+
 class HashEncoding(torch.autograd.Function):
 
     @torch.cuda.amp.custom_fwd(cast_inputs=torch.float16)
@@ -491,6 +514,8 @@ class HashEncoding(torch.autograd.Function):
         min_res: int,
         max_res: int,
         levels: int,
+        divider: int | None = None,
+        bwd_divider: int | None = None,
     ) -> Tensor:
         # Establish dimensions
         D_in = coords.shape[-1]
@@ -532,6 +557,7 @@ class HashEncoding(torch.autograd.Function):
         ), f"All tensors must be on the same device: {devices}"
 
         # Initialize output buffer
+        assert levels & (levels - 1) == 0, "Levels must be a power of 2"
         D_out = D_embed * levels + D_feature
         out_shape = coords.shape[:-1] + (D_out,)
         o = embeddings.new_empty(*out_shape, requires_grad=embeddings.requires_grad)
@@ -539,30 +565,42 @@ class HashEncoding(torch.autograd.Function):
         def grid(META):
             return (triton.cdiv(L, META["BLOCK_N"]),)
 
-        divider = levels // 2 if L >= 2**16 else levels
-        _fwd_kernel[grid](  # type: ignore
-            # fmt: off
-            coords, pi, embeddings, o,
-            coords.stride(-2), coords.stride(-1),
-            embeddings.stride(-2),
-            o.stride(-2), o.stride(-1),
-            L, D_in, D_embed,
-            max_entries_per_level, levels, min_res, max_res,
-            0, divider,
-            # fmt: on
-        )
-        if divider < levels:
-            _fwd_kernel[grid](  # type: ignore
-                # fmt: off
-                coords, pi, embeddings, o,
-                coords.stride(-2), coords.stride(-1),
-                embeddings.stride(-2),
-                o.stride(-2), o.stride(-1),
-                L, D_in, D_embed,
-                max_entries_per_level, levels, min_res, max_res,
-                divider, levels,
-                # fmt: on
-            )
+        def _launch(divider: int):
+            assert 1 <= divider <= levels, f"Divider must be between 1 and {levels}"
+            assert divider & (divider - 1) == 0, "Divider must be a power of 2"
+            for i in range(levels // divider):
+                _fwd_kernel[grid](  # type: ignore
+                    # fmt: off
+                    coords, pi, embeddings, o,
+                    coords.stride(-2), coords.stride(-1),
+                    embeddings.stride(-2),
+                    o.stride(-2), o.stride(-1),
+                    L, D_in, D_embed,
+                    max_entries_per_level, levels, min_res, max_res,
+                    i*divider, (i+1)*divider,
+                    # fmt: on
+                )
+
+        # Determine how many chunks to process the various levels in.
+        # This is mostly a function of the hardware's L2 cache and memory usage.
+        # If we can maintain a high L2 hit rate for uncoalesced embedding reads,
+        # we can run the kernel in one pass. Otherwise, it is optimal to break it up into multiple passes.
+        # The number of levels in a pass must be a power of 2.
+        #
+        # It seems like the only way to reliably choose a good divider is with autotuning.
+        # Here we choose a divider if one is not already provided
+        if divider is None:
+            key = (L, D_in, D_embed, max_entries_per_level, levels, min_res)
+            if key in DIVIDER_CONFIGS:
+                divider = DIVIDER_CONFIGS[key]
+            else:
+                dividers = HashEncoding._possible_dividers(levels)
+                runtimes = [triton.testing.do_bench(partial(_launch, divider)) for divider in dividers]
+                divider = DIVIDER_CONFIGS[key] = dividers[runtimes.index(min(runtimes))]
+        ctx.bwd_divider = bwd_divider
+
+        # Launch kernel and work through the levels
+        _launch(divider)
 
         # Copy features to output if provided
         if features is not None:
@@ -591,32 +629,40 @@ class HashEncoding(torch.autograd.Function):
         def grid(META):
             return (triton.cdiv(L, META["BLOCK_N"]),)
 
-        divider = ctx.levels // 2 if L >= 2**16 else ctx.levels
-        _bwd_kernel[grid](  # type: ignore
-            # fmt: off
-            coords, pi, do, de,
-            coords.stride(-2), coords.stride(-1),
-            do.stride(-2), do.stride(-1),
-            de.stride(-2),
-            L, D_in, D_embed,
-            ctx.max_entries_per_level, ctx.levels, ctx.min_res, ctx.max_res,
-            0, divider,
-            # fmt: on
-        )
-        if divider < ctx.levels:
-            _bwd_kernel[grid](  # type: ignore
-                # fmt: off
-                coords, pi, do, de,
-                coords.stride(-2), coords.stride(-1),
-                do.stride(-2), do.stride(-1),
-                de.stride(-2),
-                L, D_in, D_embed,
-                ctx.max_entries_per_level, ctx.levels, ctx.min_res, ctx.max_res,
-                divider, ctx.levels,
-                # fmt: on
-            )
+        def _launch(divider: int):
+            assert 1 <= divider <= ctx.levels, f"Divider must be between 1 and {ctx.levels}"
+            assert divider & (divider - 1) == 0, "Divider must be a power of 2"
+            for i in range(ctx.levels // divider):
+                _bwd_kernel[grid](  # type: ignore
+                    # fmt: off
+                    coords, pi, do, de,
+                    coords.stride(-2), coords.stride(-1),
+                    do.stride(-2), do.stride(-1),
+                    de.stride(-2),
+                    L, D_in, D_embed,
+                    ctx.max_entries_per_level, ctx.levels, ctx.min_res, ctx.max_res,
+                    i*divider, (i+1)*divider,
+                    # fmt: on
+                )
 
-        return None, de, None, None, None, None, None, None
+        divider = ctx.bwd_divider
+        if divider is None:
+            key = (L, D_in, D_embed, ctx.max_entries_per_level, ctx.levels, ctx.min_res)
+            if key in BWD_DIVIDER_CONFIGS:
+                divider = BWD_DIVIDER_CONFIGS[key]
+            else:
+                dividers = HashEncoding._possible_dividers(ctx.levels)
+                runtimes = [triton.testing.do_bench(partial(_launch, divider)) for divider in dividers]
+                divider = BWD_DIVIDER_CONFIGS[key] = dividers[runtimes.index(min(runtimes))]
+                de.fill_(0)
+
+        _launch(divider)
+
+        return None, de, None, None, None, None, None, None, None, None
+
+    @staticmethod
+    def _possible_dividers(levels: int) -> Tuple[int, ...]:
+        return tuple(2**i for i in range(int(math.log2(levels)) + 1))
 
 
 def hash_encoding(
@@ -628,7 +674,34 @@ def hash_encoding(
     min_res: int = 16,
     max_res: int = 512,
     levels: int = 16,
+    divider: int | None = None,
+    bwd_divider: int | None = None,
 ) -> Tensor:
+    r"""Implements a multi-resolution hash encoding as defined in Instant NGP.
+
+    Args:
+        coord: Coodinate inputs on the range :math:`[0, 1]`.
+        embeddings: Embedding table.
+        features: Optional features to concatenate to the output.
+        pi: Hashing primes. Will be computed for up to ``D=3`` if not provided.
+        max_entries_per_level: Maximum number of entries per hash table level.
+        min_res: Minimum resolution.
+        max_res: Maximum resolution.
+        levels: Number of hash table levels.
+        divider: Number of levels to process in a single pass. If not provided, will be autotuned.
+        bwd_divider: Number of levels to process in a single pass during backward pass. If not provided, will be autotuned.
+
+
+    Shapes:
+        ``coord`` - :math:`(..., D)` where :math:`D` is the number of spatial dimensions.
+        ``embeddings`` - :math:`(E, D_e)` where :math:`E` is the number of embeddings and :math:`D_e` is the embedding dimension.
+        ``features`` - :math:`(..., D_f)` where :math:`D_f` is the number of features.
+        ``pi`` - :math:`(D,)`
+        Output - :math:`(..., L \times D_e + D_f)` where :math:`L` is the number of levels.
+
+    Returns:
+        Retrieved embeddings concatenated with provided features for each input coordinate.
+    """
     return HashEncoding.apply(
         coord,
         embeddings,
@@ -638,5 +711,6 @@ def hash_encoding(
         min_res,
         max_res,
         levels,
+        divider,
+        bwd_divider,
     )
-

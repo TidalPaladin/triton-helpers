@@ -1,4 +1,5 @@
 import math
+from functools import partial
 
 import pytest
 import torch
@@ -6,10 +7,8 @@ import triton
 import triton.language as tl
 from torch import Tensor
 from torch.testing import assert_close
-from functools import partial
 
 from triton_helpers.layers.hash_encoding import HashEncoding, hash_encoding
-from triton_helpers.ops import to_tensor
 from triton_helpers.layers.hash_encoding.kernel import (
     PI_1,
     PI_2,
@@ -21,8 +20,8 @@ from triton_helpers.layers.hash_encoding.kernel import (
     compute_resolutions,
     create_corner_offsets,
     embedding_lookup,
-    interpolate,
     get_first_hash_level,
+    interpolate,
 )
 
 
@@ -395,59 +394,6 @@ class TestEmbeddingLookup:
 @pytest.mark.cuda
 class TestHashEncoding:
 
-    #@pytest.fixture
-    #def tinycudann(self):
-    #    Encoding = pytest.importorskip("tinycudann.modules", reason="TinyCudaNN is not installed.").Encoding
-
-    #    def func(L: int, D: int, F: int, T: int, N: int, X: int, Y: int, **kwargs):
-    #        b = math.exp((math.log(Y) - math.log(X)) / (N - 1))
-    #        config = {
-    #            "otype": "HashGrid",
-    #            "n_levels": N,
-    #            "n_features_per_level": F,
-    #            "log2_hashmap_size": int(math.log2(T)),
-    #            "base_resolution": X,
-    #            "per_level_scale": b + 1e-5,
-    #            #"interpolation": "Linear",
-    #        }
-    #        device = kwargs.get("device", "cuda")
-    #        module = Encoding(D, config, dtype=kwargs.get("dtype", torch.float32)).to(device)
-    #        return module
-    #    return func
-
-    #@pytest.mark.parametrize(
-    #    "L, D, F, T, NUM_LEVELS, N_min, N_max",
-    #    [
-    #        (4, 2, 2, 2 ** 10, 4, 2, 8),
-    #        #(4, 2, 2, 2 ** 3, 3, 2, 8),
-    #        #(4, 2, 2, 2 ** 4, 3, 2, 8),
-    #        #(4, 2, 2, 2 ** 5, 3, 2, 8),
-    #        #(4, 2, 2, 2 ** 6, 3, 2, 8),
-    #        #(4, 2, 2, 2 ** 8, 3, 2, 8),
-    #    ],
-    #)
-    #def test_tinycudann_baseline(self, L, D, F, T, NUM_LEVELS, N_min, N_max, tinycudann):
-    #    torch.random.manual_seed(0)
-
-    #    module = tinycudann(L, D, F, T, NUM_LEVELS, N_min, N_max, dtype=torch.float16, device="cuda")
-
-    #    # Inputs
-    #    t = compute_embedding_counts(NUM_LEVELS, T, D, N_min, N_max)
-    #    e = torch.randn(sum(t), F, device="cuda", dtype=torch.float16)
-
-    #    # 2, 10, 14
-    #    assert module.params.numel() == e.numel()
-    #    assert False
-    #    x = torch.rand(L, D, device="cuda")
-
-    #    # Baseline (x was set at corners so we can easily check edge features)
-    #    pi = torch.tensor([PI_1, PI_2, PI_3], device="cuda", dtype=torch.int64)[:D]
-    #    baseline = torch.zeros(L, F * NUM_LEVELS, device="cuda", dtype=torch.float16)
-    #    _cpu_hash_encoding(x, e, pi, baseline, D, F, T, NUM_LEVELS, N_min, N_max)
-
-    #    # Triton
-    #    hash_encoding(x, e, None, None, T, N_min, N_max, NUM_LEVELS)
-
     @pytest.mark.parametrize(
         "L, D, F, T, NUM_LEVELS, N_min, N_max",
         [
@@ -456,13 +402,14 @@ class TestHashEncoding:
             (4, 3, 2, 2**14, 16, 16, 512),
             (100, 3, 2, 2**14, 16, 16, 512),
             (100, 3, 2, 2**20, 16, 16, 512),
+            (65536, 3, 2, 2**20, 16, 16, 512),
         ],
     )
     def test_forward_torch_baseline(self, L, D, F, T, NUM_LEVELS, N_min, N_max):
         torch.random.manual_seed(0)
 
         # Inputs
-        r = compute_resolutions(NUM_LEVELS, N_min, N_max)
+        compute_resolutions(NUM_LEVELS, N_min, N_max)
         t = compute_embedding_counts(NUM_LEVELS, T, D, N_min, N_max)
         e = torch.randn(sum(t), F, device="cuda", dtype=torch.float16)
         x = torch.rand(L, D, device="cuda")
@@ -479,19 +426,21 @@ class TestHashEncoding:
         last_nonhash_level = hash_level - 1
         check_close = partial(assert_close, atol=1e-2, rtol=0)
         check_close(
-            o[..., hash_level*F:], baseline[..., hash_level*F:], 
+            o[..., hash_level * F :],
+            baseline[..., hash_level * F :],
             msg="Mismatch in hash level features",
         )
         check_close(
-            o[..., last_nonhash_level*F:], baseline[..., last_nonhash_level*F:],
+            o[..., last_nonhash_level * F :],
+            baseline[..., last_nonhash_level * F :],
             msg="Mismatch in the last non-hash level features",
         )
         check_close(
-            o[..., :hash_level*F], baseline[..., :hash_level*F],
+            o[..., : hash_level * F],
+            baseline[..., : hash_level * F],
             msg="Mismatch in the hash level features",
         )
         check_close(o, baseline)
-
 
     @pytest.mark.parametrize(
         "L, D, F, T, NUM_LEVELS, N_min, N_max",
@@ -530,16 +479,19 @@ class TestHashEncoding:
         last_nonhash_level = hash_level - 1
         check_close = partial(assert_close, atol=1e-2, rtol=1e-2)
         check_close(
-            de[..., hash_level*F:], baseline_de[..., hash_level*F:], 
+            de[..., hash_level * F :],
+            baseline_de[..., hash_level * F :],
             msg="Mismatch in hash level features",
         )
         check_close(
-            de[..., last_nonhash_level*F:], baseline_de[..., last_nonhash_level*F:],
+            de[..., last_nonhash_level * F :],
+            baseline_de[..., last_nonhash_level * F :],
             msg="Mismatch in the last non-hash level features",
         )
         check_close(
-            de[..., :hash_level*F], baseline_de[..., :hash_level*F],
-            msg="Mismatch in the hash level features",
+            de[..., : hash_level * F],
+            baseline_de[..., : hash_level * F],
+            msg="Mismatch in the non-hash level features",
         )
         check_close(de, baseline_de)
 
@@ -555,7 +507,6 @@ class TestHashEncoding:
             o = layer(x)
         assert isinstance(o, Tensor)
         assert o.dtype == torch.float16
-        assert False
 
     @pytest.mark.skip
     def test_backward_module(self):
@@ -570,18 +521,3 @@ class TestHashEncoding:
 
         o.sum().backward()
         assert layer.embeddings.grad is not None
-
-    @pytest.mark.skip
-    def test_backward_large(self):
-        # Shapes
-        B, L, D, F = 1, 32, 3, 2
-
-        layer = HashEncoding(2**4, 16, F, 16, 512).cuda()
-        x = torch.rand(B, L, D, device="cuda", requires_grad=True)
-
-        with torch.autocast(device_type="cuda", dtype=torch.float16):
-            o = layer(x)
-
-        o.sum().backward()
-        assert layer.embeddings.grad is not None
-        assert False

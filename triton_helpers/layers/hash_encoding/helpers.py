@@ -1,11 +1,13 @@
 import math
 import sys
-from typing import List, Final
+from typing import Final, List
 
 import torch
 from torch import Tensor
 
+
 EPS: Final = 1e-5
+
 
 def compute_b(N_min: int, N_max: int, L: int) -> float:
     r"""Computes the base of the geometric progression of resolutions.

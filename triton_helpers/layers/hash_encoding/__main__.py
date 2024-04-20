@@ -79,7 +79,7 @@ if __name__ == "__main__":
         "InstantNGP Hash Encoding",
         [TinyCudaNN("tiny-cuda-nn"), Triton("triton-hash")],
         dims={
-            "L": ((512, 2048, 8192, 16384, 32768, 65536, 65536*2), "values"),
+            "L": ((512, 2048, 8192, 16384, 32768, 65536, 65536 * 2), "values"),
             "D": (3, "values"),
             "F": (2, "values"),
             "T": (2**14, "values"),

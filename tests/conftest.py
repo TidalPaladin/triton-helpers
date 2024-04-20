@@ -48,4 +48,5 @@ def triton_debug():
 @pytest.fixture(autouse=True, scope="session")
 def no_autotune():
     from triton.runtime import Autotuner
+
     Autotuner.prune_configs = lambda self, *args, **kwargs: [self.configs[0]]
