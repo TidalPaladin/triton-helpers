@@ -25,7 +25,7 @@ class HashEncoding(nn.Module):
         self.min_res = min_res
         self.max_res = max_res
 
-    def forward(self, coords: Tensor, features: Tensor | None = None) -> Tensor:
+    def forward(self, coords: Tensor, features: Tensor | None = None, scale: float = 1.0) -> Tensor:
         return hash_encoding(
             coords,
             self.embeddings,
@@ -35,4 +35,5 @@ class HashEncoding(nn.Module):
             self.min_res,
             self.max_res,
             self.num_levels,
+            scale=scale,
         )
