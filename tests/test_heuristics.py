@@ -2,8 +2,12 @@ import sys
 
 import pytest
 import torch
+import triton
+import triton.language as tl
+from torch.testing import assert_close
 
 from triton_helpers.heuristics import (
+    BoundaryCheckHeuristic,
     DivisorHeuristic,
     IsBlockMultiple,
     PowerOfTwoHeuristic,
@@ -28,6 +32,58 @@ def test_is_block_multiple(dim, block_dim, override_val, exp):
     heuristic = IsBlockMultiple("dim", "block_dim", override_val)
     meta = {"dim": dim, "block_dim": block_dim}
     assert heuristic(meta) == exp
+
+
+class TestBoundaryCheckHeuristic:
+
+    @pytest.fixture
+    def kernel(self):
+        @triton.jit
+        def kernel(
+            x_p, o_p, M: int, N: int, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BOUNDARY_CHECK: tl.constexpr
+        ):
+            tl.static_print(BOUNDARY_CHECK)
+            tl.static_print(BOUNDARY_CHECK.value)
+            ptr = tl.make_block_ptr(x_p, (M, N), (N, 1), (0, 0), (BLOCK_M, BLOCK_N), (1, 0))
+            x = tl.load(ptr, boundary_check=BOUNDARY_CHECK.value)
+            x += tl.sum(tl.sum(x, 0), 0)
+            ptr = tl.make_block_ptr(o_p, (M, N), (N, 1), (0, 0), (BLOCK_M, BLOCK_N), (1, 0))
+            tl.store(ptr, x, boundary_check=BOUNDARY_CHECK.value)
+
+        return kernel
+
+    @pytest.mark.parametrize(
+        "M, N, BLOCK_M, BLOCK_N, exp",
+        [
+            (32, 32, 32, 32, tuple()),
+            (30, 32, 32, 32, (0,)),
+            (32, 30, 32, 32, (1,)),
+            (30, 30, 32, 32, (0, 1)),
+        ],
+    )
+    def test_conditions(self, M, N, BLOCK_M, BLOCK_N, exp):
+        heuristic = BoundaryCheckHeuristic(["M", "N"], ["BLOCK_M", "BLOCK_N"])
+        meta = {"M": M, "N": N, "BLOCK_M": BLOCK_M, "BLOCK_N": BLOCK_N}
+        assert heuristic(meta) == exp
+
+    @pytest.mark.cuda
+    @pytest.mark.parametrize(
+        "M, N, BLOCK_M, BLOCK_N",
+        [
+            (32, 32, 32, 32),
+            (30, 32, 32, 32),
+            (32, 30, 32, 32),
+            (30, 30, 32, 32),
+        ],
+    )
+    def test_in_kernel(self, kernel, M, N, BLOCK_M, BLOCK_N):
+        torch.random.manual_seed(0)
+        x = torch.randn(M, N, device="cuda")
+        o = torch.empty_like(x)
+        heuristic = BoundaryCheckHeuristic(["M", "N"], ["BLOCK_M", "BLOCK_N"])
+        kernel = triton.heuristics({"BOUNDARY_CHECK": heuristic})(kernel)
+        kernel[(1,)](x, o, M, N, BLOCK_M, BLOCK_N)
+        assert_close(o, x + x.sum(), rtol=0, atol=1e-3)
 
 
 @pytest.mark.parametrize(
