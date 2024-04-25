@@ -1,7 +1,7 @@
 import math
 import sys
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Sequence
+from typing import Any, Callable, Dict, Sequence, Tuple
 
 import torch
 import triton
@@ -30,6 +30,41 @@ class IsBlockMultiple:
         if self.override_val is not None:
             return self.override_val
         return args[self.dim] % args[self.block_dim] == 0
+
+
+@dataclass
+class BoundaryCheckHeuristic:
+    r"""Heuristic to produce a block pointer boundary check tuple given dimensions and block sizes.
+
+    The output of this heuristic should be used in a kernel as `boundary_check=BOUNDARY_CHECK.value`.
+
+    Args:
+        dim: Input dimension name or sequence of such
+        block_dim: Block dimension name or sequence of such
+
+    Returns:
+        Tuple of integers indicating which dimensions require boundary checks.
+    """
+
+    dim: str | Sequence[str]
+    block_dim: str | Sequence[str]
+
+    def __post_init__(self):
+        if isinstance(self.dim, str):
+            self.dim = [self.dim]
+        if isinstance(self.block_dim, str):
+            self.block_dim = [self.block_dim]
+        if len(self.dim) != len(self.block_dim):
+            raise ValueError("`dim` and `block_dim` must have the same length")
+
+    def __len__(self):
+        return len(self.dim)
+
+    def __call__(self, args: Dict[str, Any]) -> Tuple[int, ...]:
+        assert len(self.dim) == len(self.block_dim)
+        return tuple(
+            i for i, (dim, block_dim) in enumerate(zip(self.dim, self.block_dim)) if args[dim] % args[block_dim] != 0
+        )
 
 
 @dataclass
