@@ -195,16 +195,18 @@ class KernelExecutor:
             case Mode.BACKWARD:
                 _kwargs = self.prepare_inputs(*args, **kwargs, requires_grad=True)
                 output = self.forward(**_kwargs)
-                scalar = self.prepare_backward(output)
-                return lambda: self.backward(scalar)
+                output = self.prepare_backward(output)
+                do = torch.randn_like(output)
+                return lambda: self.backward(output, do)
 
             case Mode.FORWARD_BACKWARD:
                 _kwargs = self.prepare_inputs(*args, **kwargs, requires_grad=True)
 
                 def func():
                     output = self.forward(**_kwargs)
-                    scalar = self.prepare_backward(output)
-                    self.backward(scalar)
+                    output = self.prepare_backward(output)
+                    do = torch.randn_like(output)
+                    self.backward(output, do)
                     return output
 
                 return func
@@ -218,18 +220,19 @@ class KernelExecutor:
 
     def prepare_backward(self, forward_output: Any) -> Tensor:
         if isinstance(forward_output, Tensor):
-            return forward_output.mul(2).sum()
+            return forward_output
         else:
             raise TypeError(
-                f"Unsupported forward output {type(forward_output)}. " "Please override `prepare_backward` method."
+                f"Unsupported forward output {type(forward_output)}. "
+                "Please override `prepare_backward` method to extract and return a tensor."
             )  # pragma: no cover
 
     @abstractmethod
     def forward(self, *args, **kwargs) -> Tensor:
         raise NotImplementedError  # pragma: no cover
 
-    def backward(self, scalar: Tensor) -> None:
-        scalar.backward(retain_graph=True)
+    def backward(self, output: Tensor, do: Tensor) -> None:
+        output.backward(do, retain_graph=True)
 
     def randn(self, *args, **kwargs) -> Tensor:
         defaults = dict(requires_grad=True)
