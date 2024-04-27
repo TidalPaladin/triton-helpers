@@ -12,9 +12,9 @@ def to_tensor(val, dtype: tl.constexpr) -> tl.tensor:
 
 
 @triton.jit
-def offset_grid(BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr) -> tl.tensor:
+def offset_grid(BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, DTYPE: tl.constexpr = tl.int32) -> tl.tensor:
     r"""Create a 2D offset grid of shape :math:`(BLOCK_M, BLOCK_K)` given block sizes."""
-    return (tl.arange(0, BLOCK_M) * BLOCK_K)[:, None] + tl.arange(0, BLOCK_K)[None, :]
+    return (tl.arange(0, BLOCK_M).to(DTYPE) * BLOCK_K)[:, None] + tl.arange(0, BLOCK_K).to(DTYPE)[None, :]
 
 
 @triton.jit
