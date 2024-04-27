@@ -22,16 +22,18 @@ def test_to_tensor():
 
 
 @pytest.mark.cuda
-def test_offset_grid():
+@pytest.mark.parametrize("dtype", [tl.int32, tl.uint32])
+def test_offset_grid(dtype):
     @triton.jit
-    def kernel(o_p, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr):
-        grid = offset_grid(BLOCK_M, BLOCK_K)
+    def kernel(o_p, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, DTYPE: tl.constexpr):
+        grid = offset_grid(BLOCK_M, BLOCK_K, DTYPE)
+        tl.device_assert(tl.constexpr(grid.dtype) == DTYPE)
         tl.store(o_p + grid, grid.to(tl.float32))
 
     M = 16
     K = 4
     o = torch.zeros(M, K, dtype=torch.float16, device="cuda")
-    kernel[(1,)](o, M, K)  # type: ignore
+    kernel[(1,)](o, M, K, dtype)  # type: ignore
     assert_close(o.flatten(), torch.arange(0, M * K), check_device=False, check_dtype=False)
 
 
