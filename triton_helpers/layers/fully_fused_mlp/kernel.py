@@ -7,7 +7,7 @@ from torch import Tensor
 from torch.autograd import Function
 
 from ...heuristics import PowerOfTwoHeuristic
-from ...ops import ensure_str, import_path, relu, relu_bwd, silu, silu_bwd
+from ...ops import relu, relu2, relu2_bwd, relu_bwd, silu, silu_bwd
 
 
 # Above this size we can't keep weights in SRAM
@@ -31,16 +31,18 @@ def feedforward(
     if HAS_BIAS:
         z += b
 
-    # y = activation(z)
     if ACTIVATION == "relu":
         y = relu(z)
     elif ACTIVATION == "silu":
         y = silu(z)
     elif ACTIVATION == "none":
         y = z
+    elif ACTIVATION == "relu2":
+        y = relu2(z)
     else:
-        FN: tl.constexpr = tl.constexpr(import_path(ACTIVATION))
-        y = FN(z)
+        tl.static_assert(False, f"Invalid activation function: {ACTIVATION}")
+        # For type checker
+        y = z
 
     return y.to(dtype)
 
@@ -53,9 +55,12 @@ def feedforward_bwd_dz(z: tl.tensor, do: tl.tensor, ACTIVATION: tl.constexpr) ->
         dz = silu_bwd(z, do)
     elif ACTIVATION == "none":
         dz = do
+    elif ACTIVATION == "relu2":
+        dz = relu2_bwd(z, do)
     else:
-        FN: tl.constexpr = tl.constexpr(import_path(ACTIVATION))
-        dz = FN(z, do)
+        tl.static_assert(False, f"Invalid activation function: {ACTIVATION}")
+        # For type checker
+        dz = do
     return dz.to(do.dtype)
 
 
@@ -507,7 +512,7 @@ class _fully_fused_mlp(Function):
         w_in: Tensor, b_in: Tensor, 
         w_out: Tensor, b_out: Tensor, 
         w_hid: Tensor | None, b_hid: Tensor | None,
-        activation: str | triton.JITFunction = "relu",  
+        activation: str = "relu",
         fp16_acc: bool = False,
     ) -> Tensor:
         B, L, D = x.shape
@@ -537,7 +542,7 @@ class _fully_fused_mlp(Function):
             b_hid = x.new_empty(0)
 
         # Handle non-str activation
-        activation = ensure_str(activation, choices=["relu", "silu", "none"])
+        assert activation in ["relu", "relu2", "silu", "none"], f"Invalid activation function: {activation}"
 
         # Init output
         o = x.new_empty((B, L, D_out))
@@ -578,14 +583,16 @@ class _fully_fused_mlp(Function):
 
         # Init of these tensors depends on choice of locking, which depends on depth
         # Deadlocks seem to become an issue at small depths, so we only use locking for depth > 5.
-        if USE_LOCK := ctx.depth > 5:
+        # NOTE: There are still deadlock issues so this is currently disabled
+        # if USE_LOCK := ctx.depth > 5:
+        if USE_LOCK := False:
             dw_in = torch.zeros_like(w_in)
             db_in = torch.zeros_like(b_in)
             dw_hid = torch.zeros_like(w_hid)
             db_hid = torch.zeros_like(b_hid)
             dw_out = torch.zeros_like(w_out)
             db_out = torch.zeros_like(b_out)
-            locks = torch.empty(ctx.depth + 1, dtype=torch.int32, device=x.device)
+            locks = torch.zeros(ctx.depth + 1, dtype=torch.int32, device=x.device)
             # For some reason FP16 acc is much slower when locking is used at small L
             fp16_acc = True
         else:
@@ -659,7 +666,7 @@ def fully_fused_mlp(
         w_out: Weight tensor for the output layer
         b_out: Bias tensor for the output layer, or None if there are no additional layers
         w_hid: Weight tensor for the hidden layers, or None if there are no additional layers
-        activation: Activation function to use. Can be "relu", "silu", "none", or a custom Triton function.
+        activation: Activation function to use. Can be "relu", "relu2", "silu", or "none".
         fp16_acc: Use FP16 for accumulation. This will reduce precision and may lead to numerical instability, but
             is faster.
 

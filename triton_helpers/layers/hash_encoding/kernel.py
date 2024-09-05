@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 from torch import Tensor
+from triton.language.extra.libdevice import float2uint_rn, fmod, mulhi, popc, pow
 
 from triton_helpers.heuristics import PowerOfTwoHeuristic, SelectHeuristic, SMHeuristic
 from triton_helpers.ops import high_low_mod, to_tensor
@@ -57,7 +58,7 @@ def get_interpolation_weights(x: tl.tensor, D: tl.constexpr, BLOCK: tl.constexpr
         (N, 2**BLOCK)
     """
     # Compute interpolation weights (N, 2**D, 1)
-    w = tl.math.fmod(x, 1.0)[:, None, :]
+    w = fmod(x, 1.0)[:, None, :]
     corner_offsets = create_corner_offsets(BLOCK)[None, :, :]
     w = tl.where(corner_offsets == 0, 1 - w, w)
 
@@ -116,7 +117,7 @@ def embedding_lookup(
     tl.device_assert((T_l < 2**32), "T_l must be less than 2**32")
     tl.device_assert((N_l < 2**32), "N_l must be less than 2**32")
     tl.device_assert(
-        (tl.math.pow((N_l + 1.0).to(tl.float64), D) > T_l) == NEEDS_HASH,
+        (pow((N_l + 1.0).to(tl.float64), D) > T_l) == NEEDS_HASH,
         f"Hashing condition set incorrectly, hash={NEEDS_HASH}",
     )
 
@@ -129,10 +130,10 @@ def embedding_lookup(
     # At coarse resolution hashing isn't needed, mapping is 1:1
     if not NEEDS_HASH:  # type: ignore
         # Scale dimension D_i by (N_l + 1) ** i (this is basically a stride)
-        scale = tl.math.pow(N_l, tl.arange(0, BLOCK_D).to(tl.float32))
+        scale = pow(N_l, tl.arange(0, BLOCK_D).to(tl.float32))
         scale = tl.where(tl.arange(0, BLOCK_D) < D, scale, 0)
         # Float precision can be an issue - round instead of truncating
-        scale = tl.math.float2uint_rn(scale)
+        scale = float2uint_rn(scale)
         h = tl.sum(corners * scale.to(DTYPE)[None, None, :], axis=2)
 
     # Otherwise compute hash function
@@ -140,11 +141,11 @@ def embedding_lookup(
         # If T is a power of two we can do the modulo very fast with a bitwise and
         T_l = T_l.to(DTYPE)
         if T_POW_2:
-            tl.device_assert(tl.math.popc(T_l.to(tl.int32)) == 1, "T must be a power of 2")
+            tl.device_assert(popc(T_l.to(tl.int32)) == 1, "T must be a power of 2")
             h = tl.xor_sum(corners * pi[None, None, :], 2) & (T_l - 1)
         else:
             low = tl.xor_sum(corners * pi[None, None, :], 2)
-            high = tl.xor_sum(tl.math.mulhi(corners, pi[None, None, :]), 2)
+            high = tl.xor_sum(mulhi(corners, pi[None, None, :]), 2)
             h = high_low_mod(high, low, T_l)
 
     tl.device_assert((h < T_l) & (h >= 0), f"Embedding index out of bounds")
