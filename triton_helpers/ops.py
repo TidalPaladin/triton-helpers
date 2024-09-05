@@ -3,6 +3,7 @@ from typing import Any, Iterable
 
 import triton
 import triton.language as tl
+from triton.language.extra.libdevice import mulhi, rsqrt
 
 
 @triton.jit
@@ -21,7 +22,7 @@ def offset_grid(BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, DTYPE: tl.constexp
 def norm_coeff(t: tl.tensor) -> tl.tensor:
     r"""Compute the L2 normalization coefficient for a tensor."""
     sos = tl.sum((t * t), 1)
-    return tl.math.rsqrt(sos.to(tl.float32)).to(t.dtype)
+    return rsqrt(sos.to(tl.float32)).to(t.dtype)
 
 
 @triton.jit
@@ -56,6 +57,16 @@ def silu_bwd(x: tl.tensor, grad: tl.tensor) -> tl.tensor:
 
 
 @triton.jit
+def relu2(x: tl.tensor) -> tl.tensor:
+    return tl.maximum(x, 0) * x
+
+
+@triton.jit
+def relu2_bwd(x: tl.tensor, do: tl.tensor) -> tl.tensor:
+    return tl.where(x > 0, do * (2 * x), 0)
+
+
+@triton.jit
 def high_low_mod(high: tl.tensor, low: tl.tensor, m: tl.tensor) -> tl.tensor:
     r"""Computes a modulo from the high and low bits of an integer and m."""
     # H = (high * B + low) % m
@@ -73,7 +84,7 @@ def high_low_mod(high: tl.tensor, low: tl.tensor, m: tl.tensor) -> tl.tensor:
 def multiply_mod(x: tl.tensor, y: tl.tensor, m: tl.tensor) -> tl.tensor:
     r"""Computes (x * y) % m for integer tensors x, y, and m."""
     low = x * y
-    high = tl.math.mulhi(x, y)
+    high = mulhi(x, y)
     return high_low_mod(high, low, m)
 
 

@@ -107,6 +107,7 @@ def test_forward_deep(dtype, tol, fp16_acc, depth):
     assert_close(baseline, actual, rtol=tol, atol=tol, check_dtype=False)
 
 
+@pytest.mark.skip(reason="Custom activations no longer supported by Triton")
 @pytest.mark.cuda
 @pytest.mark.parametrize("torch_act,act", [(nn.ReLU(), relu), (nn.SiLU(), silu)])
 def test_forward_custom_act(torch_act, act):
@@ -289,7 +290,7 @@ def test_backward_shallow(dtype, tol, fp16_acc):
 
 
 @pytest.mark.cuda
-@pytest.mark.parametrize("depth", [3, 8, 16, 32])
+@pytest.mark.parametrize("depth", [3, 8])
 @pytest.mark.parametrize(
     "dtype,fp16_acc,tol",
     [

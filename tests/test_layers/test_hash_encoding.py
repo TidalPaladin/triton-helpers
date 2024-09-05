@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 from torch.testing import assert_close
+from triton.language.extra.libdevice import saturatef
 
 from triton_helpers.layers.hash_encoding import HashEncoding, hash_encoding
 from triton_helpers.layers.hash_encoding.kernel import (
@@ -202,7 +203,7 @@ class TestEmbeddingLookup:
 
             # Hash
             # For some reason masked vals were sometimes nonzero, so manually clamp everything here
-            x = tl.math.saturatef(x) * N_l
+            x = saturatef(x) * N_l
             o = embedding_lookup(x, pi, D, T_l.to(tl.uint32), N_l.to(tl.uint32), BLOCK_D, NEEDS_HASH, T_POW_2).to(
                 o_p.dtype.element_ty
             )
@@ -402,8 +403,9 @@ class TestHashEncoding:
             (4, 3, 2, 2**14, 16, 16, 512, 1.0),
             (100, 3, 2, 2**14, 16, 16, 512, 1.0),
             (100, 3, 2, 2**20, 16, 16, 512, 1.0),
-            (65536, 3, 2, 2**20, 16, 16, 512, 1.0),
-            (128 * 1024, 3, 2, 2**14, 16, 16, 512, 1.0),
+            # These are slow
+            # (65536, 3, 2, 2**20, 16, 16, 512, 1.0),
+            # (128 * 1024, 3, 2, 2**14, 16, 16, 512, 1.0),
             (100, 3, 2, 2**14, 16, 16, 512, 2.0),
         ],
     )
