@@ -203,7 +203,7 @@ def _fwd_kernel(
     # Sizes
     L: int, D_in: int, D_hidden: int, D_out: int,
     # Strides
-    stride_x_l: int, stride_o_l: int,
+    stride_x_l: int, stride_x_d: int, stride_o_l: int, stride_o_d: int,
     # Params
     ACTIVATION: tl.constexpr, DTYPE: tl.constexpr, DEPTH: tl.constexpr,
     # Blocks
@@ -221,7 +221,7 @@ def _fwd_kernel(
     X_block_ptr = tl.make_block_ptr(
         x_p,
         (L, D_in),
-        (stride_x_l, 1),
+        (stride_x_l, stride_x_d),
         (0, 0),
         (BLOCK_L, BLOCK_D_IN),
         (1, 0),
@@ -253,7 +253,7 @@ def _fwd_kernel(
     O_block_ptr = tl.make_block_ptr(
         o_p,
         (L, D_out),
-        (stride_o_l, 1),
+        (stride_o_l, stride_o_d),
         (0, 0),
         (BLOCK_L, BLOCK_D_OUT),
         (1, 0),
@@ -335,7 +335,7 @@ def _bwd_kernel_rfs(
     # Sizes
     L: int, D_in: int, D_hidden: int, D_out: int,
     # Strides
-    stride_x_l: int, stride_do_l: int,
+    stride_x_l: int, stride_x_d: int, stride_do_l: int, stride_do_d: int,
     # Params
     ACTIVATION: tl.constexpr, DTYPE: tl.constexpr, DEPTH: tl.constexpr, USE_LOCK: tl.constexpr,
     # Blocks
@@ -364,7 +364,7 @@ def _bwd_kernel_rfs(
     X_block_ptr = tl.make_block_ptr(
         x_p,
         (L, D_in),
-        (stride_x_l, 1),
+        (stride_x_l, stride_x_d),
         (0, 0),
         (BLOCK_L, BLOCK_D_IN),
         (1, 0),
@@ -375,7 +375,7 @@ def _bwd_kernel_rfs(
     DO_block_ptr = tl.make_block_ptr(
         do_p,
         (L, D_out),
-        (stride_do_l, 1),
+        (stride_do_l, stride_do_d),
         (0, 0),
         (BLOCK_L, BLOCK_D_OUT),
         (1, 0),
@@ -487,7 +487,7 @@ def _bwd_kernel_rfs(
     DX_block_ptr = tl.make_block_ptr(
         dx_p,
         (L, D_in),
-        (stride_x_l, 1),
+        (stride_x_l, stride_x_d),
         (0, 0),
         (BLOCK_L, BLOCK_D_IN),
         (1, 0),
@@ -554,7 +554,7 @@ class _fully_fused_mlp(Function):
             # fmt: off
             x, w_in, b_in, w_hid, b_hid, w_out, b_out, o,
             B * L, D_in, D_hidden, D_out,
-            x.stride(1), o.stride(1),
+            x.stride(1), x.stride(2), o.stride(1), o.stride(2),
             activation, 
             DTYPE=tl.float16 if fp16_acc else tl.float32,
             DEPTH=depth,
@@ -615,7 +615,7 @@ class _fully_fused_mlp(Function):
             dx, do, dw_in, db_in, dw_hid, db_hid, dw_out, db_out,
             locks,
             B * L, D_in, D_hidden, D_out,
-            x.stride(1), do.stride(1),
+            x.stride(1), x.stride(2), do.stride(1), do.stride(2),
             ctx.activation,
             DTYPE=tl.float16 if fp16_acc else tl.float32,
             DEPTH=ctx.depth,
