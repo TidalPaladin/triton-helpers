@@ -58,12 +58,12 @@ def silu_bwd(x: tl.tensor, grad: tl.tensor) -> tl.tensor:
 
 @triton.jit
 def relu2(x: tl.tensor) -> tl.tensor:
-    return tl.maximum(x, 0) * x
+    return tl.maximum(x, to_tensor(0, x.dtype)) * x
 
 
 @triton.jit
 def relu2_bwd(x: tl.tensor, do: tl.tensor) -> tl.tensor:
-    return tl.where(x > 0, do * (2 * x), 0)
+    return tl.where(x > 0, do * (2 * x), to_tensor(0, do.dtype))
 
 
 @triton.jit
