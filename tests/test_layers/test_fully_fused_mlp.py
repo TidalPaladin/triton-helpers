@@ -290,6 +290,9 @@ def test_backward_shallow(dtype, tol, fp16_acc):
 
 
 @pytest.mark.cuda
+@pytest.mark.parametrize(
+    "baseline_act, triton_act", [(nn.ReLU(), "relu"), (nn.SiLU(), "silu"), (nn.Identity(), "none")]
+)
 @pytest.mark.parametrize("depth", [3, 8])
 @pytest.mark.parametrize(
     "dtype,fp16_acc,tol",
@@ -300,7 +303,7 @@ def test_backward_shallow(dtype, tol, fp16_acc):
         (torch.bfloat16, True, 1e-2),
     ],
 )
-def test_backward_deep(dtype, tol, fp16_acc, depth):
+def test_backward_deep(baseline_act, triton_act, dtype, tol, fp16_acc, depth):
     torch.random.manual_seed(0)
     D_in = 8
     D_hidden = 16
@@ -308,7 +311,7 @@ def test_backward_deep(dtype, tol, fp16_acc, depth):
     B, L = 2, 2
 
     x = torch.randn((B, L, D_in), device="cuda", requires_grad=True)
-    layer = MLP(D_in, D_hidden, D_out, depth=depth).to("cuda")
+    layer = MLP(D_in, D_hidden, D_out, depth=depth, activation=baseline_act).to("cuda")
 
     # Baseline grads
     y = layer(x.float())
@@ -343,6 +346,7 @@ def test_backward_deep(dtype, tol, fp16_acc, depth):
         w_hid.to(dtype),
         b_hid.to(dtype),
         fp16_acc=fp16_acc,
+        activation=triton_act,
     )
     y.backward(do)
     dx = x.grad
@@ -385,10 +389,27 @@ def test_module(depth):
     with torch.autocast(device_type="cuda", dtype=torch.float16):
         baseline_y = layer(x)
     baseline_y.sum().backward()
+    baseline_dx = x.grad
+    baseline_dw_in = layer.layer_in.weight.grad
+    baseline_db_in = layer.layer_in.bias.grad
+    baseline_dw_out = layer.layer_out.weight.grad
+    baseline_db_out = layer.layer_out.bias.grad
+    x.grad = None
 
     # Triton output
     with torch.autocast(device_type="cuda", dtype=torch.float16):
         y = layer2(x)
     y.sum().backward()
+    dx = x.grad
+    dw_in = layer2.w_in.grad
+    db_in = layer2.b_in.grad
+    dw_out = layer2.w_out.grad
+    db_out = layer2.b_out.grad
 
     assert_close(baseline_y, y, rtol=tol, atol=tol, check_dtype=False)
+    assert_close(baseline_dx, dx, rtol=tol, atol=tol, check_dtype=False)
+    assert_close(baseline_dw_in, dw_in, rtol=tol, atol=tol, check_dtype=False)
+    assert_close(baseline_db_in, db_in, rtol=tol, atol=tol, check_dtype=False)
+    assert_close(baseline_dw_out, dw_out, rtol=tol, atol=tol, check_dtype=False)
+    assert_close(baseline_db_out, db_out, rtol=tol, atol=tol, check_dtype=False)
+    assert_close(baseline_db_in, db_in, rtol=tol, atol=tol, check_dtype=False)
